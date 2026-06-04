@@ -1,0 +1,2821 @@
+---
+title: "Mapping the processes leading to ecological novelty"
+author: "Alejandro Ordonez"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-overflow: wrap
+    number-sections: true
+execute:
+  message: false
+  warning: false
+editor: visual
+bibliography: references.bib
+csl: science.csl
+editor_options: 
+  chunk_output_type: console
+---
+
+## Introduction {#sec-introduction}
+
+This document presents the scripts used to construct [***Figure 2***]{.underline}, as referenced in **Ordonez et al. (in preparation)**. The mapping is grounded in the idea that understanding core community assembly processes—dispersal, abiotic filtering, biotic interactions, and ecological drift—offers a systematic framework for anticipating the emergence of novel ecosystems and their consequences. By thoroughly analysing the components of the community assembly machinery and how they interrelate, we can improve our predictions of the ecological novelty that arises from human influence. This understanding will also enable us to more effectively navigate the processes that guide us toward a desired future environmental state.
+
+## Mapping Dispersal Limitation {#sec-dispersal}
+
+Mapping the role of dispersal in the formation of novel ecosystems involves assessing the capacity of species, functional groups, or communities to track changing environmental conditions (i.e. does dispersal capacity match the rate of ecological change?). It also involves evaluating changes in colonisation dynamics and alterations in connectivity across landscapes.
+
+To illustrate this, we have chosen map the overall mismatch between shifts in climatic conditions (i.e., Climate displacement cf. [@ordonez2016]) and dispersal distances derived from dispersal kernels or probabilities.
+
+Climate displacement refers to the velocity at which combined climate isoclines—representing lines of equal climatic conditions—shift across geographic areas due to alterations in temperature and precipitation over time. Displacement is quantified using the speed of climate velocity vectors (@fig-VelEstimate).
+
+```{r}
+#| label: Velestimation
+#| eval: false
+
+# ==============================================================================
+# SECTION 0: PACKAGE LOADING
+# ==============================================================================
+
+# --- 1a. Package loading ------------------------------------------------------
+
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data for rnaturalearth
+
+# Load custom velocity functions (SpatHetFnc, VelocityFnc)
+# SpatHetFnc: estimates the spatial gradient (∇X) of a climate variable
+# VelocityFnc: divides temporal gradient (ΔX/yr) by spatial gradient (∇X)
+source("./Displacement/Functions/VelocityFnc.R")
+
+
+# ==============================================================================
+# SECTION 1: LOAD AND PREPARE CLIMATE DATA
+# ==============================================================================
+
+# --- 1a. Baseline climate (historical: ~1970–2000)-----------------------------
+
+# --- 1b. Load seasonal means for temperature and precipitation from CCSM4------
+# Layers 1–4: Seasonal mean temperature (°C) for MAM / JJA / SON / DJF
+# Layers 5–8: Seasonal total precipitation (mm) for MAM / JJA / SON / DJF
+clim_vars_now <- c(
+  rast("./Displacement/Historical/CCSM4/CCSM4_1970_to_2000_Tm.Seasonal.tif"),
+  rast("./Displacement/Historical/CCSM4/CCSM4_1970_to_2000_P.Seasonal.tif")
+)
+names(clim_vars_now) <- c(
+  paste0("Temp_", c("MAM","JJA","SON","DJF")),
+  paste0("Prec_", c("MAM","JJA","SON","DJF"))
+)
+
+# --- 1c. Future climate (2085–2115, RCP 6.0, CCSM4)----------------------------
+
+clim_vars_fut <- c(
+  rast("./Displacement/RCP60/CCSM4/CCSM4_2085_to_2115_Tm.Seasonal.tif"),
+  rast("./Displacement/RCP60/CCSM4/CCSM4_2085_to_2115_P.Seasonal.tif")
+)
+names(clim_vars_fut) <- c(
+  paste0("Temp_", c("MAM","JJA","SON","DJF")),
+  paste0("Prec_", c("MAM","JJA","SON","DJF"))
+)
+
+
+# ==============================================================================
+# SECTION 2: REPROJECT AND RESAMPLE TO EQUAL-AREA GRID
+# ==============================================================================
+
+# The Eckert IV projection (+proj=eck4) is area-preserving, which is essential
+# for computing spatial gradients in physically meaningful units (km).
+
+# --- 2a. Project baseline and future rasters to Eckert IV----------------------
+StartPeriodPrj <- project(clim_vars_now, "+proj=eck4", method = "near", threads = 50)
+EndPeriodPrj   <- project(clim_vars_fut, "+proj=eck4", method = "near", threads = 50)
+
+# --- 2b. Create a 50 × 50 km template raster in Eckert IV----------------------
+# 50 km is a reasonable grain for global-scale displacement analysis and
+# avoids artificial precision given GCM output resolutions (~100–200 km)
+eck4Rast <- rast(
+  extent     = ext(StartPeriodPrj),
+  resolution = 50000,   # 50,000 m = 50 km
+  crs        = "+proj=eck4"
+)
+
+# --- 2c. Resample both periods to the 50 × 50 km grid--------------------------
+# Temperature layers (1–4) rounded to 1 decimal; precipitation (5–8) to 0 (integer mm)
+
+StartPeriod_50x50 <- lapply(1:dim(StartPeriodPrj)[3], function(x) {
+  round(resample(StartPeriodPrj[[x]], eck4Rast, threads = 50),
+        ifelse(x >= 5, 0, 1))
+})
+
+EndPeriod_50x50 <- lapply(1:dim(EndPeriodPrj)[3], function(x) {
+  round(resample(EndPeriodPrj[[x]], eck4Rast, threads = 50),
+        ifelse(x >= 5, 0, 1))
+})
+
+
+# ==============================================================================
+# SECTION 3: COMPUTE CLIMATE VELOCITY COMPONENTS
+# ==============================================================================
+# For each climate variable × season combination, climate velocity is:
+#   V = (ΔX / Δt) / ∇X
+# where:
+#   ΔX / Δt  = temporal gradient = change per year (future − baseline) / 50 yrs
+#   ∇X       = spatial gradient  = local slope of the climate surface (units/km)
+
+# --- 3a. Spatial gradient (∇X) for baseline climate----------------------------
+# SpatHetFnc computes the magnitude of the local spatial gradient using a
+# focal window, with the cell resolution supplied in km (here 50 km)
+SpatHetTmp <- lapply(StartPeriod_50x50, function(x) {
+  SpatHetFnc(RastIn = x, Dist = res(x)[1] / 1000)  # convert m → km
+})
+
+# --- 3b. Temporal gradient (ΔX / Δt)-------------------------------------------
+# Divided by 50 to express as change per year (2085–2115 midpoint minus
+# 1970–2000 midpoint spans approximately 100 years; here using the 50-yr
+# half-interval consistent with centred midpoints at 1985 and 2100)
+TimeHetAnomaly <- lapply(1:length(EndPeriod_50x50), function(x) {
+  (EndPeriod_50x50[[x]] - StartPeriod_50x50[[x]]) / 50
+})
+
+# --- 3c. Scalar velocity for each variable × season----------------------------
+# VelocityFnc divides temporal by spatial gradient (Loarie et al. 2009)
+VelocityAnomaly <- lapply(1:length(EndPeriod_50x50), function(x) {
+  VelocityFnc(TimeHetAnomaly[[x]], SpatHetTmp[[x]])
+})
+
+# --- 3d. Combine into a single multi-layer raster and restore variable names---
+clim_vel_2100 <- do.call("c", VelocityAnomaly)
+names(clim_vel_2100) <- names(clim_vars_now)
+
+# --- 3e. Save the raster-------------------------------------------------------
+writeRaster(clim_vel_2100,
+            "./Displacement/RCP60/CCSM4/CCSM4_1970_to_2000_Velocity.Seasonal.tif",
+            overwrite =TRUE)
+
+clim_vel_2100a
+
+# --- 3f. Plot------------------------------------------------------------------
+# --- 3g. Load and project global vector data-----------------------------------
+world <- vect(ne_countries(scale = "medium", returnclass = "sf")) 
+# Retrieves country polygons at medium resolution and converts them to a 'SpatVector'
+
+wrld_simpl2 <- project(world,"+proj=eck4")
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+
+ggplot(wrld_simpl2) +
+  
+  # Raster layer: log10-transformed displacement for display
+  # log10 transformation linearises the colour scale across orders of magnitude
+  geom_spatraster(data = log10(clim_vel_2100)) +
+  facet_wrap(~lyr) +
+  
+  # Colour scale with interpretable legend labels in original units (km/yr)
+  scale_fill_whitebox_c(
+    palette = "muted",       # Muted, perceptually uniform palette
+    na.value = NA,           # Transparent where data are missing (ocean, ice, etc.)
+    breaks = -2:2,           # Log10 breakpoints: 0.01, 0.1, 1, 10, 100 km/yr
+    labels = c("<0.01", "0.1", "1", "10", ">100"),
+    name = "Displacement [km/yr]",
+    limit = c(-2, 2),        # Clip colour scale to 0.01–100 km/yr range
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = 15,
+      barheight      = 0.5
+    )
+  ) +
+  
+  # Overlay country borders (transparent fill, outline only)
+  geom_spatvector(fill = NA) +
+  
+  labs(
+    title    = "Climate Velocity for 2100 under RCP 6.0",
+    subtitle = "Seasonal climate velocity under RCP 6.0 (CCSM4) · Eckert IV equal-area projection"
+  ) +
+  
+  theme(
+    legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+```
+
+```{r}
+#| label: fig-VelEstimate
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: Estimate of the speed (in km per year) of seasonal climate variables between 2000 and 2100 under RCP 6.0 for CCSM4.
+#| fig-height: 8
+#| fig-width: 8
+
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data for rnaturalearth
+
+# ==============================================================================
+# SECTION 1: COMPUTE CLIMATE VELOCITY COMPONENTS
+# ==============================================================================
+
+# --- 1a. # Load the Scalar velocity for each variable × season-----------------
+
+clim_vel_2100 <- rast("./Displacement/RCP60/CCSM4/CCSM4_1970_to_2000_Velocity.Seasonal.tif")
+clim_vel_2100 <- app(clim_vel_2100,function(x){ifelse(x<0.01,0.01,
+                                                      ifelse(x>100,100,x))})
+
+# --- 1b. Load and project global vector data-----------------------------------
+world <- vect(ne_countries(scale = "medium", returnclass = "sf")) 
+# Retrieves country polygons at medium resolution and converts them to a 'SpatVector'
+
+wrld_simpl2 <- project(world,"+proj=eck4")
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+
+# --- 1c. Plot------------------------------------------------------------------
+
+ggplot(wrld_simpl2) +
+  
+  # Raster layer: log10-transformed displacement for display
+  # log10 transformation linearises the colour scale across orders of magnitude
+  geom_spatraster(data = log10(clim_vel_2100)) +
+  facet_wrap(~lyr) +
+  
+  # Colour scale with interpretable legend labels in original units (km/yr)
+  scale_fill_whitebox_c(
+    palette = "muted",       # Muted, perceptually uniform palette
+    na.value = NA,           # Transparent where data are missing (ocean, ice, etc.)
+    breaks = -2:2,           # Log10 breakpoints: 0.01, 0.1, 1, 10, 100 km/yr
+    labels = c("<0.01", "0.1", "1", "10", ">100"),
+    name = "Displacement [km/yr]",
+    limit = c(-2, 2),        # Clip colour scale to 0.01–100 km/yr range
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = 15,
+      barheight      = 0.5
+    )
+  ) +
+  
+  # Overlay country borders (transparent fill, outline only)
+  geom_spatvector(fill = NA) +
+  
+  labs(
+    title    = "Climate Velocity for 2100 under RCP 6.0",
+    subtitle = "Seasonal climate velocity under RCP 6.0 (CCSM4) · Eckert IV equal-area projection"
+  ) +
+  
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+```
+
+Displacement is quantified as the geometric mean of the speeds of climate velocity vectors (@fig-Displace). In [@ordonez2024], this is based on the median of seasonal temperature and precipitation values (means/totals, respectively). This metric jointly captures the spatial gradient of climatic conditions and the temporal trajectory of climate change. Displacement thus reflects the rate at which species must shift their ranges to remain aligned with a changing climate. For instance, between 1901 and 2013, the global mean displacement for temperature and precipitation was estimated at 3.7 kilometers per decade [@ordonez2016], indicating the approximate rate at which species in a community must move to maintain cohesion.
+
+```{r}
+#| label: VelDisp_estimation
+#| eval: false
+# Displacement formula (Ordóñez et al. 2016):
+#   For each season s:
+#     V_T_s  = ΔT_s / ∇T_s     [km/yr] — scalar velocity for temperature
+#     V_P_s  = ΔP_s / ∇P_s     [km/yr] — scalar velocity for precipitation
+#     D_s    = sqrt(V_T_s² + V_P_s²)    — displacement magnitude for season s
+#
+#   Overall displacement:
+#     D_total = geometric mean of D_s across all seasons
+#             = 10^(mean(log10(D_s)))
+#
+#   Note: the geometric mean (via log-space averaging) is used rather than the
+#   arithmetic mean because velocity/displacement distributions are strongly
+#   right-skewed and span several orders of magnitude.
+#
+# ==============================================================================
+# SECTION 1: COMPUTE CLIMATE DISPLACEMENT (SENSU ORDÓÑEZ ET AL. 2016)
+# ==============================================================================
+#
+# Overall displacement across seasons uses the geometric mean (log-space mean)
+# to account for the right-skewed, multi-order-of-magnitude distribution of
+# displacement values across the globe.
+
+# --- 1a. Load the Climate velocity vectors-------------------------------------
+clim_vel_2100 <- rast("./Displacement/RCP60/CCSM4/CCSM4_1970_to_2000_Velocity.Seasonal.tif")
+
+# --- 1b. Compute per-season displacement: Euclidean norm of T and P velocity ve
+seasons <- c("MAM", "JJA", "SON", "DJF")
+
+Disp_seasonal <- lapply(seasons, function(s) {
+  V_T <- clim_vel_2100[[paste0("Temp_", s)]]   # Temperature scalar velocity [km/yr]
+  V_P <- clim_vel_2100[[paste0("Prec_", s)]]   # Precipitation scalar velocity [km/yr]
+  sqrt(V_T^2 + V_P^2)  # Pythagorean combination — displacement for season s [km/yr]
+})
+names(Disp_seasonal) <- seasons
+
+# Stack seasonal displacement layers
+Disp_seasonal_stack <- Disp_seasonal[[1]]
+for (i in 2:length(Disp_seasonal)){
+  Disp_seasonal_stack <- c(Disp_seasonal_stack,Disp_seasonal[[i]])
+}
+names(Disp_seasonal_stack) <- seasons
+
+# Geometric mean across seasons using log-space arithmetic mean
+# Geometric mean = 10^(mean(log10(x))) — appropriate for multiplicative, 
+# log-normally distributed quantities such as climate velocities
+
+Disp_2100 <- 10^(mean(log10(Disp_seasonal_stack)))
+names(Disp_2100) <- "Displacement_kmyr"
+
+# ==============================================================================
+# SECTION 2: MAP CLIMATE DISPLACEMENT
+# ==============================================================================
+
+# --- 2a. Load medium-resolution country polygons and project to Eckert IV------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+# --- 2b. Plot------------------------------------------------------------------
+
+ggplot(wrld_simpl2) +
+
+  # Raster layer: log10-transformed displacement for display
+  # log10 transformation linearises the colour scale across orders of magnitude
+  geom_spatraster(data = log10(Disp_2100)) +
+
+  # Colour scale with interpretable legend labels in original units (km/yr)
+  scale_fill_whitebox_c(
+    palette = "muted",       # Muted, perceptually uniform palette
+    na.value = NA,           # Transparent where data are missing (ocean, ice, etc.)
+    breaks = -1:3,           # Log10 breakpoints: 0.01, 0.1, 1, 10, 100 km/yr
+    labels = c("<0.1", "1", "10", "100",">1000"),
+    name = "Displacement [km/yr]",
+    limit = c(-1, 3),        # Clip colour scale to 0.01–100 km/yr range
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = 15,
+      barheight      = 0.5
+    )
+  ) +
+
+  # Overlay country borders (transparent fill, outline only)
+  geom_spatvector(fill = NA) +
+
+  labs(
+    title    = "Climate Displacement for 2100 under RCP 6.0",
+    subtitle = paste0(
+      "Displacement = geometric mean across seasons of √(V²_temp + V²_precip)\n",
+      "Sensu Ordóñez et al. (2016, Nature Climate Change)"
+    )
+  ) +
+
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+```
+
+```{r}
+#| label: fig-Displace
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: Estimate of the displacement speed (in km per year) of seasonal climate variables between 2000 and 2100 under RCP 6.0.
+
+# Load a single layer (third layer) from a multi-layer displacement raster
+Disp_2100 <- rast("./Displacement/RCP60/CCSM4/CCSM4_DispDiv_RCP60_1999to2049.tif")
+Disp_2100 <- app(Disp_2100,function(x){ifelse(x>100,100,x)})
+
+# --- 1a. Prepare basemap vector data ------------------------------------------
+
+# Load medium-resolution country polygons and project to Eckert IV
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+# --- 1b. Plot -----------------------------------------------------------------
+
+# --- 2b. Plot------------------------------------------------------------------
+
+ggplot(wrld_simpl2) +
+
+  # Raster layer: log10-transformed displacement for display
+  # log10 transformation linearises the colour scale across orders of magnitude
+  geom_spatraster(data = log10(Disp_2100)) +
+
+  # Colour scale with interpretable legend labels in original units (km/yr)
+  scale_fill_whitebox_c(
+    palette = "muted",       # Muted, perceptually uniform palette
+    na.value = NA,           # Transparent where data are missing (ocean, ice, etc.)
+    breaks = -1:3,           # Log10 breakpoints: 0.01, 0.1, 1, 10, 100 km/yr
+    labels = c("<0.1", "1", "10", "100",">1000"),
+    name = "Displacement [km/yr]",
+    limit = c(-1, 3),        # Clip colour scale to 0.01–100 km/yr range
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = 15,
+      barheight      = 0.5
+    )
+  ) +
+
+  # Overlay country borders (transparent fill, outline only)
+  geom_spatvector(fill = NA) +
+
+  labs(
+    title    = "Climate Displacement for 2100 under RCP 6.0",
+    subtitle = paste0(
+      "Displacement = geometric mean across seasons of √(V²_temp + V²_precip)\n",
+      "Sensu Ordóñez et al. (2016, Nature Climate Change)"
+    )
+  ) +
+
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+
+```
+
+To illustrate this, we use the maximum dispersal distances reported by [@bullock2017] for 10 growth forms (herb, graminoid, shrub, tree) and different dispersal modes (ant, ballistic, wind, vertebrate, rodent), estimated from the best-fitting dispersal kernel functions (see @tbl-Bullock). We then compare these values with European climate displacement maps for 2100 under RCP 6.0 from [@ordonez2024]. For this, we extract the maximum distance that seeds from different plants can travel per reproductive event from [@bullock2017]. The Exponential Power and log-sech functions are the two best-performing models for describing seed dispersal kernels across a range of plant types and dispersal modes (@tbl-Bullock). Here, we focus on the long-distance dispersal events estimated by [@bullock2017].
+
+| Growth Form | Dispersal Mode        | Exponential Power | Log-sec |
+|-------------|-----------------------|:-----------------:|:-------:|
+| Herb        | Ant                   |       1.552       |  1.572  |
+| Herb        | Ballistic             |       4.926       |  6.838  |
+| Herb        | Wind (with appendage) |       1.303       |  1.305  |
+| Herb        | Wind (no appendage)   |       0.258       |  1.757  |
+| Graminoid   | Wind (no appendage)   |       7.836       |  3.623  |
+| Shrub       | Ant                   |       12.95       |  17.91  |
+| Shrub       | Vertebrate            |       130.1       |  20.29  |
+| Tree        | Rodent                |       245.2       |  35.12  |
+| Tree        | Vertebrate            |       1751        |  897.1  |
+| Tree        | Wind (with appendage) |       371.6       |  317.9  |
+
+: Estimates of the maximum (95th percentile) distance (in m) seeds from species from four growth forms (i.e., Herb, Graminoid, Shrub, Tree) could move based on kernel-density estimates from [@bullock2017]. Values were estimated using both an exponential power ($\frac{b}{2 \pi a^2 \Gamma(2/b)} \exp\left(-\left(\frac{d}{a}\right)^b\right)$) and a log-hyperbolic secant function ($H(t) = a_{ij} x^{b_{ij}}$), as these distributions allow for the description of fat-tailed distributions.
+
+Using these values, we estimate dispersal lag from the seed dispersal kernels reported in [@bullock2017]. Specifically, we compute an environmental (log) ratio between climate displacement and the potential seed movement associated with a given dispersal vector in a particular growth environment. This ratio contrasts the rate of climate displacement with the movement capacity of plant species, indicating whether climate change proceeds at a pace that species can track. As illustrated in @fig-KernelRto, a species group with a specific growth form and dispersal vector can either move faster than shifting climates (ratio \> 1 or positive log-ratio) or lag behind them (ratio \< 1 or negative log-ratio). As our purpose is to illustrate the aproach, we restrict our calculations to estimates derived from the Exponential Power function.
+
+```{r}
+#| label: fig-KernelRto
+#| message: false
+#| warning: false
+#| fig-cap: Estimate of the difference between the maximum distance a seed can be dispersed per year and the displacement of seasonal climate variables per year from 2000 to 2100 under RCP 6.0.
+#| fig-height: 8
+#| fig-width: 8
+
+# This section creates a multi-panel map visualization comparing species displacement 
+# rates to climate velocity across different Growth form/vector combinations where:
+##    - Red areas: Species displacement slower than climate velocity
+##    - Neutral colors: Species displacement matches climate velocity  
+##    - Blue areas: Species displacement faster than climate velocity
+# - Each panel represents a different Growth form/vector combination from the input raster
+
+# ==============================================================================
+# SECTION 1: MULTI PANEL VISUALIZATION
+# ==============================================================================
+
+#--- 1a. Load medium-resolution country polygons and project to Eckert IV -------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+#--- 1b. Load a single layer (third layer) from a multi-layer displacement raster -
+Disp_2100 <- rast("./Displacement/RCP60/CCSM4/CCSM4_DispDiv_RCP60_1999to2049.tif")
+
+#--- 1c. Load a table with the Movement capacity of different species. -----------
+# This reads dispersal distance data from Bullock et al. 2017 study
+MaxDispKer_Table <- read.csv("./Displacement/DisplacementRates/Bullock2017_Dispersal_Distances.csv")
+
+#--- 1d. Create a combined variable ----------------------------------------------
+# This combines Growth Form (e.g., tree, shrub, herb) and Dispersal Mode (e.g., wind, animal)
+# into a single categorical variable for easier analysis and visualization
+MaxDispKer_Table <- MaxDispKer_Table %>%
+  mutate(Combined = str_c(`Growth.Form`, `Dispersal.Mode`, sep = "-"))
+
+#--- 1e. Estimate the Log10 Ratio between the Maximum Movement capacity and climate -- displacement 
+# This calculates how fast species can move relative to how fast climate is changing
+##    - Exponential.Power/1000: converts dispersal distance to km (assuming original units in meters)
+##    - Disp_2100: projected climate displacement distance by 2100 (defined elsewhere)
+##    - log10 transformation: makes ratios easier to interpret (0 = equal rates, positive = faster than climate)
+LogRto_DisplacemnetVsKernelDist <- log10((MaxDispKer_Table$Exponential.Power/1000)/Disp_2100)
+
+# Assign meaningful names to the ratio values using the combined categories
+names(LogRto_DisplacemnetVsKernelDist) <- MaxDispKer_Table$Combined
+
+
+#--- 1f. plotting ---------------------------------------------------------------
+ggplot(wrld_simpl2) +                          
+  # Initiate plot with the vector world map as base layer
+  geom_spatraster(data = LogRto_DisplacemnetVsKernelDist) +   
+  # Add raster layer containing log10-transformed displacement ratios
+  # This shows how species displacement compares to climate velocity
+  
+  # Configure colour scale for continuous raster values
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use a muted colour palette for readability
+    direction = -1,              # Reverse palette direction so red indicates lower values 
+                                # (species moving slower than climate)
+    na.value = NA,               # Do not assign a colour to NA values (keeps them transparent)
+    breaks = c(-6, 0, 6),        # Legend breaks corresponding to log10 values
+                                # -6 = 1/1,000,000x slower, 0 = same speed, 6 = 1,000,000x faster
+    labels = c("Slower than\nClimate", "Same", "Faster than\nClimate"), 
+                                # Human-readable labels that convert log10 back to linear interpretation
+    name = "Ratio",              # Legend title indicating what the values represent
+    limit = c(-6, 6),            # Limit the colour scale to show ratios from 6 orders of magnitude
+                                # slower to 6 orders faster than climate velocity
+    guide = guide_colorbar(      # Customize the color bar appearance
+      title.position = "top",    # Position legend title above the color bar
+      title.hjust = 0.5,         # Center the legend title horizontally
+      barwidth = 15,             # Make color bar wider for better visibility
+      barheight = 0.5            # Keep color bar relatively thin to save space
+    )
+  ) +
+  
+  facet_wrap(~lyr, ncol = 3) +   # Create multiple panels per layer in the raster
+                                # Arranged in 3 columns for optimal layout
+                                # Each panel shows a different dispersal type
+  
+  geom_spatvector(fill = NA) +   # Overlay the world vector borders on top
+                                # fill = NA means only outlines are drawn (no country fill)
+  
+  theme(legend.position = "bottom") + # Move the legend to the bottom for better layout
+                                    # This maximizes space for the map panels
+    # Add title and improve overall appearance
+  labs(
+    title    = "Match between climate displacement\nand dispersal capacity depending on dispersal vector",
+    subtitle = "Log₁₀ ratio of seed dispersal distance per year to climate displacement rate (Bullock et al. 2017)"
+  ) +
+  
+  # Adjust overall plot layout
+  theme(
+    legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin = margin(5, 2, 5, 2)
+  )
+
+
+```
+
+We can extend this approach to quantify the mean dispersal lag across multiple groups. For each group, we compute the (log) ratio of climate displacement to seed dispersal distance and then take the harmonic mean of these ratios as a summary metric of dispersal lag. As illustrated in @fig-CommLag, this community-level metric is interpreted analogously to group-specific ratios but represents the aggregate dispersal lag of the assemblage.
+
+```{r}
+#| label: fig-CommLag
+#| message: false
+#| warning: false
+#| fig-cap: Estimate the community-level lag, defined as the geometric mean of seed dispersal lag across 10 functional groups. For each group, differences are calculated as the ratio of the maximum distance a seed can be dispersed annually to the annual displacement of seasonal climate variables from 2000 to 2100 under RCP 6.0.
+
+
+# This section creates a single-panel map visualization indicating the overall mismatch 
+# between displacement rates to climate velocity summarized in the mismatch across
+# different Growth form/vector combinations where:
+##    - Values < 0 (red/warm colors): Species move slower than climate displacement
+##    - Values = 0 (neutral): Species movement matches climate displacement  
+##    - Values > 0 (blue/cool colors): Species move faster than climate displacement
+
+# ==============================================================================
+# SECTION 1: SINGLE PANEL VISUALIZATION
+# ==============================================================================
+
+#--- 1a. Load medium-resolution country polygons and project to Eckert IV -------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+#--- 1b. Calculate as the geometric mean of all species group ratios ------------
+# This provides an overall measure of how well the biological community can track climate change
+CommunityLag <- mean(LogRto_DisplacemnetVsKernelDist) 
+
+#--- 1c. plotting ---------------------------------------------------------------
+ggplot(wrld_simpl2) +                          
+  # Initiate plot with the vector world map as base layer
+  geom_spatraster(data = CommunityLag) +   
+  # Add raster layer showing movement capacity ratios across geographic space
+  
+    # Configure colour scale for continuous raster
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use muted color palette for better visual readability
+    direction = -1,              # Reverse palette direction so red indicates lower values 
+                                 # (species moving slower than climate)
+    na.value = NA,               # Set NA values to transparent (no color assigned)
+    breaks = c(-5,-2.5,0),          # Define legend breakpoints: 6 orders of magnitude range
+    #labels = c("Slower than\nClimate", "Same", "Faster than\nClimate"), # User-friendly labels
+    labels = c("Much slower than\nClimate",
+               "Sliglty slower than\nClimate",
+               "Same"), # User-friendly labels
+    name = "Ratio",              # Title for the legend
+    limit = c(-5, 0),            # Constrain color scale to ±6 orders of magnitude
+    
+    guide = guide_colorbar(      # Configure color bar appearance
+      title.position = "top",    # Place legend title above the color bar
+      title.hjust = 0.5,         # Center the legend title horizontally
+      barwidth = 15,             # Increase color bar width for better visibility
+      barheight = 0.5            # Keep color bar thin to conserve vertical space
+    )) +
+    
+# Add country/region boundaries on top
+  geom_spatvector(fill = NA) +   # Overlay world borders as transparent polygons (outline only)
+  
+  # Add title and improve overall appearance
+  labs(
+    title    = "Match between climate displacement\nand dispersal capacity across dispersal vectors",
+    subtitle = "Geometric mean dispersal lag across growth-form × dispersal-vector combinations"
+  ) +
+  
+  # Adjust overall plot layout
+  theme(
+    legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+```
+
+------------------------------------------------------------------------
+
+## Mapping Abiotic Filtering {#sec-abiotic}
+
+Mapping the role of abiotic filtering in the formation of novel ecosystems requires spatial assessments of environmental change, such as shifts in climate or land cover. This includes, for example, identifying areas with no-analogue states relative to historical baselines or evaluating changes in climatic suitability for community groups using species distribution models or stability metrics of species co-occurrence. These approaches help predict where abiotic filtering may exclude historically dominant species and favour those previously marginal or absent, recognising that no-analogue conditions can undermine traditional species–climate distribution predictions. To illustrate this, we map the emergence of novel climates by 2100 under RCP 6.0, following [@ordonez2024]. Here, novel climates refer to future climatic combinations with no current analogue (i.e. no location presently experiences climate conditions similar to those projected for that location in the future due to climate change; cf. [@williams2007; @jackson2000]).
+
+Here, we build on the idea that no-analogue climates—future climate combinations with no close matches under current conditions—provide a useful basis for mapping the effects of environmental filtering. Following [@ordonez2024], we characterise no-analogue climates by estimating Climate Novelty for each grid cell in the future climate layer as the minimum Mahalanobis distance to any grid cell in the current climate space (@fig-Novelty). This measure captures how dissimilar future climate conditions are from those presently observed. The use of Mahalanobis distance is particularly advantageous because it incorporates correlations among climate variables, as shown by [@burke2019; @ordonez2024]. In contrast, other studies have relied on Standardized Euclidean Distances (SED), which measure Euclidean distance in climate space after standardising each dimension by the variable’s interannual variability (e.g. [@williams2007; @ordonez2014a]).
+
+```{r}
+#| label: NoveltyEstimate
+#| eval: false
+#| message: false
+#| warning: false
+
+# This script quantifies the degree to which future climates (2085–2115) lack
+# analogues in the baseline climate (1970–2000), following the Mahalanobis
+# distance framework of Ordóñez et al. (2016). Three outputs are stored per
+# grid cell:
+# Mahalanobis distance is used rather than Euclidean distance in climate space
+# because it accounts for the covariance structure (and different units/scales)
+# among climate variables, making the metric scale-independent.
+
+# --- 0. Package loading ------------------------------------------------------
+
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data package for rnaturalearth
+library(parallel)           # Base-R parallel computing (replaces deprecated snowfall)
+
+# ==============================================================================
+# SECTION 1: LOAD AND PREPARE CLIMATE DATA
+# ==============================================================================
+
+# --- 1a. Baseline climate (historical: ~1970–2000, CCSM4)----------------------
+
+# Layers 1–4: Seasonal mean temperature (°C) — MAM / JJA / SON / DJF
+# Layers 5–8: Seasonal total precipitation (mm) — MAM / JJA / SON / DJF
+clim_vars_now <- c(
+  rast("./Novelty/Historical/CCSM4/CCSM4_1970_to_2000_Tm.Seasonal.tif"),
+  rast("./Novelty/Historical/CCSM4/CCSM4_1970_to_2000_P.Seasonal.tif")
+)
+names(clim_vars_now) <- c(
+  paste0("Temp_", c("MAM","JJA","SON","DJF")),
+  paste0("Prec_", c("MAM","JJA","SON","DJF"))
+)
+
+# --- 1b. Future climate (2085–2115, RCP 6.0, CCSM4)----------------------------
+
+clim_vars_fut <- c(
+  rast("./Novelty/RCP60/CCSM4/CCSM4_2085_to_2115_Tm.Seasonal.tif"),
+  rast("./Novelty/RCP60/CCSM4/CCSM4_2085_to_2115_P.Seasonal.tif")
+)
+names(clim_vars_fut) <- c(
+  paste0("Temp_", c("MAM","JJA","SON","DJF")),
+  paste0("Prec_", c("MAM","JJA","SON","DJF"))
+)
+
+# ==============================================================================
+# SECTION 2: REPROJECT AND RESAMPLE TO EQUAL-AREA GRID
+# ==============================================================================
+# Eckert IV (+proj=eck4) is an equal-area projection essential for ensuring
+# that spatial gradient computations and geographic distances are in consistent,
+# physically meaningful units (metres → km).
+
+# --- 2a. Project both periods to Eckert IV-------------------------------------
+StartPeriodPrj <- project(clim_vars_now, "+proj=eck4", method = "near", threads = 50)
+EndPeriodPrj   <- project(clim_vars_fut, "+proj=eck4", method = "near", threads = 50)
+
+# Template raster at 50 × 50 km resolution
+# 50 km grain is appropriate for global analyses and avoids over-precision
+# relative to the native GCM resolution (~100–200 km)
+eck4Rast <- rast(
+  extent     = ext(StartPeriodPrj),
+  resolution = 50000,   # 50,000 m = 50 km
+  crs        = "+proj=eck4"
+)
+
+# --- 2b. Resample to 50 × 50 km------------------------------------------------
+# Temperature (layers 1–4): round to 1 decimal place (°C precision)
+# Precipitation (layers 5–8): round to integer mm
+StartPeriod_50x50 <- lapply(1:dim(StartPeriodPrj)[3], function(x) {
+  round(resample(StartPeriodPrj[[x]], eck4Rast, threads = 50),
+        ifelse(x >= 5, 0, 1))
+})
+
+EndPeriod_50x50 <- lapply(1:dim(EndPeriodPrj)[3], function(x) {
+  round(resample(EndPeriodPrj[[x]], eck4Rast, threads = 50),
+        ifelse(x >= 5, 0, 1))
+})
+
+# ==============================================================================
+# SECTION 3: PREPARE DATA FOR MAHALANOBIS DISTANCE COMPUTATION
+# ==============================================================================
+
+# Stack baseline (columns 1–8) and future (columns 9–16) into one value matrix.
+# Rows with any NA (ocean, ice sheets, etc.) are removed so the covariance
+# matrix and distance calculations are not distorted by missing data.
+Normal_Future_Climate_rast <- values(
+  c(do.call("c", StartPeriod_50x50),
+    do.call("c", EndPeriod_50x50)),
+  na.rm = FALSE   # Retain all rows; NAs filtered explicitly below
+)
+
+# --- 3a. Identify cells that have complete data in BOTH baseline and future per
+# Only these cells enter the novelty computation; results are mapped back using
+# their row indices (cell_with_data) at the end.
+cell_with_data <- which(
+  complete.cases(Normal_Future_Climate_rast)
+)
+
+# --- 3b. Subset to complete cases only-----------------------------------------
+Normal_Future_Climate_rast <- Normal_Future_Climate_rast[cell_with_data, ]
+
+# Scale the full matrix (baseline + future combined).
+# Scaling to zero mean and unit variance is required before computing
+# Mahalanobis distance to avoid variables with large absolute ranges (e.g.
+# precipitation in mm) dominating over variables with small ranges (e.g.
+# temperature in °C). Scaling is applied jointly so that future values are
+# expressed in the same standardised units as the baseline reference.
+Normal_Future_Climate_rastScl <- scale(Normal_Future_Climate_rast)
+
+# Separate the scaled baseline (columns 1–8) and future (columns 9–16)
+Baseline_Scl <- Normal_Future_Climate_rastScl[, 1:8]   # n_cells × 8
+Future_Scl   <- Normal_Future_Climate_rastScl[, 9:16]  # n_cells × 8
+
+# Pre-compute the covariance matrix of the BASELINE climate space.
+# This is the reference distribution against which novelty is measured.
+# Using only baseline data ensures the covariance structure reflects the
+# observed historical climate, not the (potentially novel) future climate.
+CoVarMtrx <- cov(Baseline_Scl)
+
+# Retrieve the (projected, equal-area) coordinates for all complete cells.
+# These are used to compute geographic distances between a future cell and
+# its closest baseline analogue.
+CordsNormal <- crds(StartPeriod_50x50[[1]], df = FALSE)[cell_with_data, ]
+
+
+# ==============================================================================
+# SECTION 4: COMPUTE CLIMATE NOVELTY (PARALLEL)
+# ==============================================================================
+# For each future grid cell x:
+#   (a) Extract the 8-variable future climate vector for cell x.
+#   (b) Compute the Mahalanobis distance from cell x to every cell in the
+#       baseline climate data frame (using the baseline covariance matrix).
+#   (c) Identify the baseline cell with the minimum Mahalanobis distance
+#       (= closest climatic analogue).
+#   (d) If multiple cells share the minimum MD (ties), select the one that is
+#       geographically closest to cell x.
+#   (e) Record: MD.min, analogue cell index, geographic distance to analogue.
+#
+# Note: `parallel::mclapply` replaces the deprecated `snowfall::sfLapply`.
+# On Windows, mclapply falls back to single-core; use parLapply instead.
+# The number of cores (20) should be adjusted to the available hardware.
+
+n_cores <- 20  # Adjust to available CPUs
+
+MDMin_list <- mclapply(
+  1:nrow(Future_Scl),
+  function(x) {
+
+    # (a) Future climate vector for cell x (1 × 8 named numeric vector)
+    TrgCellVals <- Future_Scl[x, ]
+
+    # (b) Mahalanobis distance from cell x to ALL baseline cells
+    # mahalanobis() returns a vector of length n_baseline_cells
+    MD_all <- mahalanobis(Baseline_Scl,
+                          center = TrgCellVals,
+                          cov    = CoVarMtrx)
+
+    # (c) Index / indices of the closest baseline analogue(s)
+    min_MD    <- min(MD_all, na.rm = TRUE)
+    tied_idx  <- which(MD_all == min_MD)   # may be >1 if tied
+
+    # (d) Among tied analogues, select the geographically nearest one
+    if (length(tied_idx) == 1) {
+      best_idx <- tied_idx
+    } else {
+      geo_dists <- as.vector(
+        terra::distance(
+          x      = matrix(CordsNormal[x, ],       ncol = 2),
+          y      = matrix(CordsNormal[tied_idx, ], ncol = 2),
+          lonlat = FALSE          # coordinates are in metres (Eckert IV)
+        )
+      )
+      best_idx <- tied_idx[which.min(geo_dists)]
+    }
+
+    # (e) Geographic distance (km) from future cell x to its closest analogue
+    DistKm <- as.vector(
+      terra::distance(
+        x      = matrix(CordsNormal[x, ],        ncol = 2),
+        y      = matrix(CordsNormal[best_idx, ], ncol = 2),
+        lonlat = FALSE
+      )
+    ) / 1000   # convert metres → km
+
+    # Return a one-row data frame for this cell
+    data.frame(
+      ID       = x,
+      MD.min   = round(min_MD, 3),  # Minimum Mahalanobis distance (novelty degree)
+      Cell     = best_idx,           # Baseline row index of closest analogue
+      DistinKm = round(DistKm, 2)   # Geographic distance to closest analogue (km)
+    )
+  },
+  mc.cores = n_cores
+)
+
+# --- 4a. Combine per-cell results into a single data frame---------------------
+MDMin <- do.call("rbind", MDMin_list)
+
+# ==============================================================================
+# SECTION 5: RECONSTRUCT RASTER FROM RESULTS
+# ==============================================================================
+# --- 5a. Assign the three output metrics back to a spatial raster that matches 
+# 50 × 50 km Eckert IV grid. Only cells in cell_with_data receive values;
+# all other cells (ocean, no-data) remain NA.
+
+# Initialise a three-layer raster with the same extent/CRS as the working grid
+MDminSumm <- rast(eck4Rast, nlyrs = 3)
+
+# --- 5b. Write results into the rows corresponding to complete-data cells------
+# MDMin[, -1] drops the ID column, leaving MD.min / Cell / DistinKm
+MDminSumm[cell_with_data] <- as.matrix(MDMin[, -1])
+
+names(MDminSumm) <- c("MD.min", "Cell", "DistinKm")
+
+# ==============================================================================
+# SECTION 6: MAP CLIMATE NOVELTY
+# ==============================================================================
+
+# --- 6a. Load and project country boundaries to Eckert IV for overlay----------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+# Log10-transform MD.min for display: the raw Mahalanobis distance spans several
+# orders of magnitude globally, so a log scale provides a better-balanced map.
+# Legend breaks are set at meaningful quantile-derived thresholds.
+log10_breaks <- c(-2.097, -1.330, -0.446,  0.675,  1.429)
+break_labels <- c("Min", "Low", "Medium", "High", "Maximum")
+
+ggplot(wrld_simpl2) +
+
+  # Raster layer: log10(MD.min) — layer 1 of MDminSumm
+  geom_spatraster(data = log10(MDminSumm[["MD.min"]])) +
+
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,
+    breaks   = log10_breaks,
+    labels   = break_labels,
+    name     = "Climate novelty (Mahalanobis distance)",
+    guide    = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = 15,
+      barheight      = 0.5
+    )
+  ) +
+
+  geom_spatvector(fill = NA) +   # Country borders, outline only
+
+  labs(
+    title    = "Degree of climate novelty by 2100 under RCP 6.0",
+    subtitle = paste0(
+      "Novelty = minimum Mahalanobis distance of future climate to any baseline cell\n",
+      "Sensu Ordóñez et al. (2016, Nature Climate Change)"
+    )
+  ) +
+
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(5, 5, 5, 5)
+  )
+
+```
+
+```{r}
+#| label: fig-Novelty
+#| echo: false
+#| fig-cap: Climate novelty assessed by computing the minimum Mahalanobis distance between future climate conditions and the range of present climate variability, enabling the identification of areas where future climates will differ significantly from current conditions. The output indicates the minimum Mahalanobis distance from a future climate condition to the nearest present climate analog across all current locations.
+#| fig-height: 6
+#| fig-width: 8
+
+# --- 1a. Package loading ------------------------------------------------------
+
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data package for rnaturalearth
+library(parallel)           # Base-R parallel computing (replaces deprecated snowfall)
+
+
+#--- 1b.Data Loading --------------------------------------------------
+# Load pre-computed climate novelty raster based on Mahalanobis distance
+# File contains minimum Mahalanobis distance values for RCP 6.0 scenario (2099)
+MDminSumm <- rast("./Novelty/RCP60/CCSM4/MDminSumm_CCSM4_RCP60_2100.tif",
+                     lyrs=1)
+
+#--- 1c. Load and project country boundaries to Eckert IV for overlay -
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+#--- 1d. Log10-transform MD.min for display: the raw Mahalanobis distance spans several
+# orders of magnitude globally, so a log scale provides a better-balanced map.
+# Legend breaks are set at meaningful quantile-derived thresholds.
+log10_breaks <- c(-2.097, -1.330, -0.446,  0.675,  1.429)
+break_labels <- c("Min", "Low", "Medium", "High", "Maximum")
+
+#--- 1b.Ploting ------------------------------------------------------ 
+ggplot(wrld_simpl2) +
+
+  # Raster layer: log10(MD.min) — layer 1 of MDminSumm
+  geom_spatraster(data = log10(MDminSumm[["MD.min"]])) +
+
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,
+    breaks   = log10_breaks,
+    labels   = break_labels,
+    name     = "Climate novelty (Mahalanobis distance)",
+    guide    = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = 15,
+      barheight      = 0.5
+    )
+  ) +
+
+  geom_spatvector(fill = NA) +   # Country borders, outline only
+
+  labs(
+    title    = "Degree of climate novelty by 2100 under RCP 6.0",
+    subtitle = paste0(
+      "Novelty = minimum Mahalanobis distance of future climate to any baseline cell\n",
+      "Sensu Ordóñez et al. (2016, Nature Climate Change)"
+    )
+  ) +
+
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(5, 5, 5, 5)
+  )
+
+```
+
+------------------------------------------------------------------------
+
+## Mapping Biotic Interactions {#sec-biotic}
+
+Biotic interactions are central to the formation of novel ecosystems because they shape community assembly, demographic dynamics, and species coexistence. Processes such as competition, predation, mutualism, and parasitism determine where species can establish and persist, and thereby structure emerging communities. By influencing selection and local adaptation, shifts in interaction networks can trigger eco-evolutionary feedbacks, reinforcing priority effects and creating path-dependent trajectories of change. These cascading outcomes are pivotal for the emergence of novel ecosystems: as species assemblages reorganise under environmental change, restructured interaction networks can decouple communities from historical baselines and generate unprecedented species combinations. Mapping biotic interaction dynamics provides a critical lens for anticipating where and how novel ecological states are likely to arise.
+
+One simple way to visualise potential changes in species interactions is to map shifts in seed-disperser diversity resulting from the loss of all currently endangered seed-dispersing species. To do this, we use data from [@fricke2022] to quantify the global diversity of seed dispersers (birds and mammals; @fig-DispRich) and the diversity of those species classified as endangered, based on IUCN categories Vulnerable, Endangered, Critically Endangered, Extinct in the Wild, and Extinct (@fig-DispEndg). We then calculate the proportion of current species richness that is at risk (@fig-DispRiskChng), thereby identifying areas where a high fraction of mutualistic interactions is likely to be lost.
+
+Here, we use distribution data for seed-dispersing vertebrates—birds and mammals—originally compiled and employed by @fricke2022. Mammalian range estimates were drawn from the Phylogenetic Atlas of Mammal Macroecology, PHYLACINE 1.2.1 [@faurby2020], a comprehensive, globally standardised database that provides both present-natural and current range maps for all extant and recently extinct mammal species, incorporating phylogenetic information alongside spatial range data. This dataset is particularly well-suited for analyses of biotic interactions under environmental change, as it explicitly distinguishes between ranges reflecting species' ecological potential and those shaped by contemporary human impacts such as hunting and habitat loss. Bird ranges were sourced from BirdLife International [@BirdLifeMaps2024], the globally recognised authority on avian distribution, whose spatial range data are compiled from expert knowledge, field surveys, and remote sensing, and are updated periodically to reflect range contractions, expansions, and extinction events.
+
+```{r}
+#| label: fig-DispRich
+#| message: false
+#| warning: false
+#| fig-cap: Global map showing the richness of plant seed dispersers (birds and mammals) -  Data from [@fricke2022].
+#| fig-height: 6
+#| fig-width: 8
+
+
+# --- 0. Package loading ------------------------------------------------------
+
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data package for rnaturalearth
+library(parallel)           # Base-R parallel computing (replaces deprecated snowfall)
+
+
+# ==============================================================================
+# SECTION 1: MAP THE DISTRIBUTION OF SEED DISPERSERS
+# ==============================================================================
+
+#--- 1a. Load the distribution maps --------------------------------------------
+#### Load mammals distribution maps
+mamm_pres <- rast("./Interactions/Dispersers/rast_mamm_pres_nat.tif")
+#### Load birds distribution maps
+bird_pres <- rast("./Interactions/Dispersers/rast_bird_pres_nat.tif")
+#### make a spatRast for All Animals
+animal_pres <- c(mamm_pres,bird_pres)
+
+#--- 1b. Define Disperser richness ---------------------------------------------
+disperser.rich.Rast <- sum(animal_pres)
+
+#--- 1c. Load and project country boundaries to Eckert IV for overlay ----------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+
+#--- 1d. plotting --------------------------------------------------------------
+ggplot(wrld_simpl2) +                          # Initiate plot with the vector world map as base
+  # wrld_simpl2 is a spatial vector data-set (likely country boundaries)
+  # This establishes the coordinate system and base layer for the map
+  
+  geom_spatraster(data = disperser.rich.Rast) +
+  # geom_spatraster() plots raster data (gridded spatial data)
+  
+  # Configure colour scale for continuous raster
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use a muted colour palette for readability
+    # "muted" creates softer, less saturated colors that are easier on the eyes
+    # white-box package provides scientifically-appropriate color palettes
+    
+    na.value = NA,               # Do not assign a colour to NA values
+    # NA values (missing data) will be transparent/invisible on the map
+    # This prevents misleading visualization of missing data areas
+    
+    breaks = seq(0,1200,by=120),               # Legend breaks
+    labels = seq(0,1200,by=120), # Human readable labels
+    
+    name = "Disperser fauna richness",     # Legend title indicating the unit
+  
+      limit = c(0, 1200),            # Limit the colour scale to 0 and 1
+    # Values outside this range will be colored as the extreme colors
+    # This prevents outliers from dominating the color scale
+    
+    guide = guide_colorbar(
+      title.position = "top",  # Position the legend title above the color bar
+      title.hjust = 0.5,       # Center the title horizontally (0.5 = center)
+      barwidth = 15,           # Make the color bar 15 units wide (relatively wide)
+      barheight = 0.5          # Make the color bar 0.5 units tall (relatively thin)
+    )
+  ) +
+  
+  geom_spatvector(fill = NA) +   # Overlay the world vector borders on top without fill (only outlines)
+  # This adds country/region boundaries as black lines
+  # fill = NA means no fill color, just the outline
+  # This helps viewers identify geographic regions
+  
+  labs(
+    title    = "Current diversity of seed dispersers",
+    subtitle = "Birds and mammals combined · Data from Fricke et al. (2022)"
+  ) +
+  theme(
+    legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+```
+
+For both taxonomic groups, range maps were intersected with occurrence data from the IUCN Red List, which provides additional information on conservation status and population trends. Together, distribution data from PHYLACINE/BirdLife and IUCN offer broad taxonomic coverage of functionally important seed-dispersing vertebrates and provide a robust empirical basis for assessing how changes in vertebrate distributions disrupt plant–animal mutualistic networks and, ultimately, drive shifts in community composition and ecological novelty. To explore this last point, we considered a scenario of changing contemporary mammal and bird species composition. Specifically, we modelled an extinction scenario in which all extant animal species currently listed as Vulnerable, Endangered, Critically Endangered, Extinct in the Wild, or Extinct in the IUCN Red List are hypothetically lost, while retaining the present ranges of all species not classified under these categories (@fig-DispEndg). For this, we relied on the endangerment scenarios compiled by @fricke2022.
+
+```{r}
+#| label: fig-DispEndg
+#| message: false
+#| warning: false
+#| fig-cap: Global map showing the richness plant seed dispersers (birds and mammals) considered at risk of extinction (species assessed as Critically Endangered, Endangered, or Vulnerable by the IUCN – REF). Data from [@fricke2022].
+#| fig-height: 6
+#| fig-width: 8
+
+# ==============================================================================
+# SECTION 1: DEFINE CONSERVATION STATUS
+# ==============================================================================
+
+#--- 1a. Load Trait data for dispersers ---------------------------------------------
+## Load the bird trait data from Fricke
+load("./Interactions/Dispersers/all.bird.traits_Simple.RData") #--> traits birds
+#### Filter to the variables of interest
+all.bird.traits <- all.bird.traits[,c("name.m","animal.group","iucn.category")]
+
+## Load the mammal trait data from Fricke
+load("./Interactions/Dispersers/all.mamm.traits_Simple.RData") #--> traits mammals
+#### Filter to the variables of interest
+all.mamm.traits <- all.mamm.traits[,c("name.m","animal.group","iucn.category")]
+#### Full Animal Matrix
+all.animal.traits <- rbind(all.bird.traits,all.mamm.traits)
+
+
+## Match the trait matrix to the occurrence raster
+all.animal.traits.filetered <- all.animal.traits[gsub(" ",".",all.animal.traits$name.m)%in%names(animal_pres),]
+
+#--- 1b. Create a 1/0 Vector saying if a species is Endangered or not ----------
+## Here the Vulnerable, Endangered, Critically Endangered, Extinct in the Wild and Extinct cathetegories are used to define "Risk".
+is.at.risk <- (all.animal.traits.filetered$iucn.category%in%c("EN","VU","CR","CR (PE)","EP","EX","EW"))*1
+names(is.at.risk) <- gsub(" ",".",all.animal.traits.filetered$name.m) 
+## Reorganize so the risk vector is in the same order as the names in the raster file
+is.at.risk <- is.at.risk[names(animal_pres)]
+
+
+#--- 1c. Estimate the richness of endangered dispersers ------------------------
+## Set the presence value to 0 for all species that are considered endangered.
+endangered.presence.Rast <- animal_pres[[is.at.risk==T]]
+## Estimate the richness of endangered dispersers
+endangered.rich.Rast <- sum(endangered.presence.Rast)
+
+#--- 1d. Load and project country boundaries to Eckert IV for overlay ----------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+#--- 1e. plotting --------------------------------------------------------------
+ggplot(wrld_simpl2) +                          # Initiate plot with the vector world map as base
+  geom_spatraster(data = endangered.rich.Rast) +   
+
+  # Configure colour scale for continuous raster
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use a muted colour palette for readability
+    na.value = NA,               # Do not assign a colour to NA values
+    # NA values (missing data) will be transparent/invisible on the map
+    breaks = seq(0,70,by=10),               # Legend breaks
+    labels = seq(0,70,by=10), # Human readable labels
+    name = "Endangered disperser fauna richness",     # Legend title indicating the unit
+    
+      limit = c(0, 70),            # Limit the colour scale to 0 and 1
+    # Values outside this range will be colored as the extreme colors
+    guide = guide_colorbar(
+      title.position = "top",  # Position the legend title above the color bar
+      title.hjust = 0.5,       # Center the title horizontally (0.5 = center)
+      barwidth = 15,           # Make the color bar 15 units wide (relatively wide)
+      barheight = 0.5          # Make the color bar 0.5 units tall (relatively thin)
+    )
+  ) +
+  
+  geom_spatvector(fill = NA) +   # Overlay the world vector borders on top without fill (only outlines)
+  
+  theme(legend.position = "bottom") + # Move the legend to the bottom for better layout
+  
+  labs(
+    title    = "Current diversity of endangered seed dispersers",
+    subtitle = "Species assessed as at risk by IUCN · Data from Fricke et al. (2022)"
+  ) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+
+```
+
+Using the distribution and endangerment information, we then estimate the proportion of seed-disperser species (birds and mammals) considered at risk of extinction (@fig-DispRiskChng). We calculate the ratio of the endangerment-reduced assemblage richness to the full current assemblage richness, expressed as $\text{Reduced} / \text{Full}$ as a metric of "Interaction novelty". This ratio ranges from zero, indicating that all locally present seed dispersers are at risk of extinction, to one, indicating that no species in the local assemblage face elevated extinction risk, and thus provides an intuitive, spatially explicit index of how much of the current seed-dispersal function is likely to be retained under ongoing biodiversity loss.
+
+Using the distribution and endangerment information, we then estimate the proportion of seed-disperser species (birds and mammals) considered at risk of extinction (@fig-DispRiskChng). We calculate the ratio of the endangerment-reduced assemblage richness to the full current assemblage richness, expressed as $\text{Reduced} / \text{Full}$ as a metric of "Interaction novelty". This ratio ranges from zero, indicating that all locally present seed dispersers are at risk of extinction, to one, indicating that no species in the local assemblage face elevated extinction risk, and thus provides an intuitive, spatially explicit index of how much of the current seed-dispersal function is likely to be retained under ongoing biodiversity loss.
+
+```{r}
+#| label: fig-DispRiskChng
+#| message: false
+#| warning: false
+#| fig-cap: Global map showing the proportion of plant seed dispersers (birds and mammals) considered at risk of extinction (species assessed as Critically Endangered, Endangered, or Vulnerable by the IUCN – REF). Data from [@fricke2022].
+#| fig-height: 6
+#| fig-width: 8
+
+# ==============================================================================
+# SECTION 1: DEFINE PROPORTION OF DISPERSERS LOST
+# ==============================================================================
+
+#--- 1a. Estimate the Diversity change
+Disperser.rich.change.Rast <- (log10(endangered.rich.Rast/disperser.rich.Rast))
+
+#--- 1b. Load and project country boundaries to Eckert IV for overlay ----------
+world       <- vect(ne_countries(scale = "medium", returnclass = "sf"))
+wrld_simpl2 <- project(world, "+proj=eck4")
+
+
+# 1c. plotting -----------------------------------------------------------------
+ggplot(wrld_simpl2) +                          # Initiate plot with the vector world map as base
+
+  geom_spatraster(data = Disperser.rich.change.Rast) +   # Add raster layer after log10 transformation (e.g., for better scaling)
+  # Configure colour scale for continuous raster
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use a muted colour palette for readability
+    na.value = NA,               # Do not assign a colour to NA values
+    breaks = c(0.025,log10(c(5,10,20,30,40)/100)),               # Legend breaks
+    labels = c("<2%",paste0(c(5,10,20,30,40),"%")), # Human readable labels
+    
+    name = "Proportion of the disperser fauna\n clasified as endangered",     # Legend title indicating the unit
+    
+      limit = c(-1.6, -0.3),            # Limit the colour scale to -1.6 and -0.3 in log scale
+    guide = guide_colorbar(
+      title.position = "top",  # Position the legend title above the color bar
+      title.hjust = 0.5,       # Center the title horizontally (0.5 = center)
+      barwidth = 15,           # Make the color bar 15 units wide (relatively wide)
+      barheight = 0.5          # Make the color bar 0.5 units tall (relatively thin)
+    )
+  ) +
+  geom_spatvector(fill = NA) +   # Overlay the world vector borders on top without fill (only outlines)
+  theme(legend.position = "bottom") + # Move the legend to the bottom for better layout
+  labs(
+    title = "Diversity of seed dispersers loss.",
+    subtitle = "Proportion of the current diversity of seed dispersers\nlost if species classified as endangered go extinct."
+  ) + 
+  # Adjust overall plot layout
+  theme(
+    legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+    plot.title       = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+```
+
+------------------------------------------------------------------------
+
+## Ecological Drift {#sec-drift}
+
+Ecological drift (i.e., stochastic fluctuations in species abundances and occurrences [@vellend2010]) can be quantified by measuring the extent to which observed patterns of species composition and abundance reflect stochastic demographic processes rather than deterministic environmental or biotic filtering. The primary approach involves comparing observed communities against stochastic expectations generated through null models, which randomize species occurrences or abundances while maintaining key constraints such as species frequencies or total richness @Harvey1983; @ulrich2010; @gotelli1996null.
+
+Here we use ranges, Extent of Occurrence endangerment estimates, and dated phylogeny information, to assess how the phylogeny diversity of plant assemblages (i.e., the sum of branch lengths of all the species in an Assemble - Faith Phylogeny diversity [@faith1992]) would change if all threatened plants (i.e., Vulnerable, Endangered, and Critically Endangered) were lost, and how this change compares to the loss of a random subset of the same number of species. This comparison allowed us to calculate the magnitude of ecological drift relative to deterministic assembly processes using the Standardised Effect Sizes (SES) as a metric, as it allows inference about the magnitude of drift relative to deterministic assembly processes.
+
+Here, we leverage the iNaturalist Geomodel [@cole2023] used to develop the [iNaturalist Open Range Map Dataset](https://www.inaturalist.org/pages/range_maps) and focus on the 41,879 ranges generated for plant species. We use this data-set to illustrate other potential data sources that could be applied when estimating the mechanisms driving the emergence of ecological novelty. Also, we acknowledge that this is a very small subset of all plant species (\~350,000; sensu [@WCVP2024]), but it provides a large enough pool of species with range data, that can be easily downloaded, so we can demonstrate our ideas.
+
+Range data for plant species are provided as polygon vectors in GeoPackage (`.gpkg`) format from the iNaturalist geomodel. Here we rasterise each species polygon to a common grid template. Each GeoPackage batch is processed separately to manage memory. Also, only records with `rank == "species"` are rasterised; higher-level taxa are skipped. Output rasters are written as multi-layer GeoTIFFs, one per batch. After rasterising all batches, we stack them and compute species richness (the number of species present in each grid cell) to see the patterns in the iNaturalist data-set (@fig-richness-map).
+
+```{r}
+#| label: load-vectors
+#| eval: false
+
+#--- 0. Load Packages ----------------------------------------------------------
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data for rnaturalearth
+library(parallel)           # Run in parallel
+library(sf)                 # load and work with sf objects 
+
+# ==============================================================================
+# SECTION 1: MAP THE DISTRIBUTION OF PLANT SPECIES
+# ==============================================================================
+
+
+#--- 1a. Load all GeoPackages in the working directory into a list. ------------
+# Each .gpkg may contain multiple records at different taxonomic ranks
+# (species, genus, family, etc.), so we will filter to species-level later.
+plants_ranges_vct_list <- lapply(
+  dir("./Drift/Distributions/",
+      pattern = ".gpkg",
+      full.names = TRUE),
+  function(x) st_read(x)
+)
+
+#--- 1b. Re-project Vectors ----------------------------------------------------
+
+# Load the raster template that defines the target grid (extent,
+# resolution, CRS). All rasters produced in this pipeline will share
+# this grid. The template is derived from pre-existing plant presence data.
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+
+# Re-project all range vectors to match the CRS of the raster template.
+# This is necessary before rasterisation to ensure spatial alignment.
+plants_ranges_vct_reproject_list <- lapply(
+  plants_ranges_vct_list,
+  function(x) {
+    st_transform(x, crs = terra::crs(plant_rast_template, proj = TRUE))
+  }
+)
+
+#--- 1c. Rasterise and Save the range maps -------------------------------------
+
+for (j in seq_along(plants_ranges_vct_reproject_list)) {
+  
+  # Rasterise each species polygon to the template grid.
+  # Returns NULL for non-species records (genus, family, etc.).
+  plants_ranges_rast_list <- lapply(
+    seq_len(nrow(plants_ranges_vct_reproject_list[[j]])),
+    function(i) {
+      vct_use <- plants_ranges_vct_reproject_list[[j]][i, ]
+      
+      if (vct_use$rank == "species") {
+        r <- rasterize(vct_use[, "rank"], plant_rast_template)
+        names(r) <- vct_use$name   # Use species name as layer name
+        return(r)
+      }
+      # Implicitly returns NULL for non-species records
+    }
+  )
+  
+  # Combine species rasters into a single multi-layer raster,
+  # dropping NULL entries from non-species records
+  plants_ranges_rast <- do.call(
+    "c",
+    plants_ranges_rast_list[which(plants_ranges_rast_list != "NULL")]
+  )
+  
+  # Save the batch raster
+  writeRaster(
+    plants_ranges_rast,
+    paste0("./Drift/Distributions/iNaturalist_geomodel_Plantae_", j, ".tif"),
+    overwrite = TRUE
+  )
+}
+
+# ==============================================================================
+# SECTION 2: PLOT THE PLANT SPECIES RICHNESS
+# ==============================================================================
+
+
+#--- 2a. Sum layers to get species richness per cell; ignore NAs (ocean/no-data)
+plant_richness <- app(plant_range_raster, sum, na.rm = TRUE)
+
+#--- 2b. Mask out ocean cells using the template (which only covers land) ------
+plant_richness_masked <- mask(plant_richness, plant_rast_template)
+
+#--- 2c. Load and project global vector data
+world <- vect(ne_countries(scale = "medium", returnclass = "sf")) 
+# Retrieves country polygons at medium resolution and converts them to a 'SpatVector'
+wrld_simpl2 <- project(world,"+proj=eck4")
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+
+#--- 2d. plotting --------------------------------------------------------------
+ggplot(wrld_simpl2) +                          # Initiate plot with the vector world map as base
+                                               # wrld_simpl2 is a spatial vector data-set (likely country boundaries)
+                                               # This establishes the coordinate system and base layer for the map
+  
+  geom_spatraster(data = log10(plant_richness_masked)) +   # Add raster layer after log10 transformation (e.g., for better scaling)
+                                               # geom_spatraster() plots raster data (gridded spatial data)
+                                               # Disp_2100 appears to be displacement data, possibly climate projections for year 2100
+                                               # log10() transformation compresses the data range and makes extreme values more visible
+                                               # This is common when data spans several orders of magnitude
+  
+  # Configure colour scale for continuous raster
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use a muted colour palette for readability
+                                 # "muted" creates softer, less saturated colors that are easier on the eyes
+                                 # white-box package provides scientifically-appropriate color palettes
+    
+    na.value = NA,               # Do not assign a colour to NA values
+                                 # NA values (missing data) will be transparent/invisible on the map
+                                 # This prevents misleading visualization of missing data areas
+    
+    breaks = 1:4,                # Legend breaks corresponding to log10 values
+                                 # Creates 5 breaks: -2, -1, 0, 1, 2
+                                 # These correspond to 0.01, 0.1, 1, 10, 100 in original units
+    
+    labels = 10^c(1:4),          # Labels convert log10 back to linear interpretation
+
+    name = "Species Richness",   # Legend title indicating the unit
+                                 # Clearly identifies what the colors represent
+                                 # Units suggest this is measuring speed/rate of change
+    
+    limit = c(1, 4),            # Limit the colour scale to log10(10) and log10(10000)
+                                 # Values outside this range will be colored as the extreme colors
+                                 # This prevents outliers from dominating the color scale
+    
+    guide = guide_colorbar(
+        title.position = "top",  # Position the legend title above the color bar
+        title.hjust = 0.5,       # Center the title horizontally (0.5 = center)
+        barwidth = 15,           # Make the color bar 15 units wide (relatively wide)
+        barheight = 0.5          # Make the color bar 0.5 units tall (relatively thin)
+    )
+  ) +
+  
+  geom_spatvector(fill = NA) +   # Overlay the world vector borders on top without fill (only outlines)
+                                 # This adds country/region boundaries as black lines
+                                 # fill = NA means no fill color, just the outline
+                                 # This helps viewers identify geographic regions
+  
+  labs(
+    title    = "Global Vascular Plant Species Richness",
+    subtitle = "iNaturalist Geomodel ranges · log₁₀(species per cell) · Eckert IV equal-area projection"
+  ) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(5, 5, 5, 5)
+  )
+
+```
+
+```{r}
+#| label: fig-richness-map
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: Species richness per grid cell across all plant species with iNaturalist range data.
+#| fig-height: 6
+#| fig-width: 8
+
+library(terra)              # Raster and vector spatial data handling
+library(tidyterra)          # terra–ggplot2 integration
+terraOptions(progress = 0)  # Suppress progress bars in rendered output
+library(tidyverse)          # Data manipulation and visualisation
+library(rnaturalearth)      # Natural Earth country polygons as sf objects
+library(rnaturalearthdata)  # Required data for rnaturalearth
+library(parallel)           # Run in parallel
+library(sf)                 # load and work with sf objects 
+
+# ==============================================================================
+# SECTION 2: PLOT THE PLANT SPECIES RICHNESS
+# ==============================================================================
+
+#---1b. Load the Richness raster------------------------------------------------
+plant_richness_masked <- rast("./Drift/Distributions/iNaturalist_richness.tif")
+
+#---1b. Load and project global vector data ------------------------------------
+world <- vect(ne_countries(scale = "medium", returnclass = "sf")) 
+# Retrieves country polygons at medium resolution and converts them to a 'SpatVector'
+wrld_simpl2 <- project(world,"+proj=eck4")
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+
+#---1c. plotting ---------------------------------------------------------------
+ggplot(wrld_simpl2) +                          # Initiate plot with the vector world map as base
+                                               # wrld_simpl2 is a spatial vector data-set (likely country boundaries)
+                                               # This establishes the coordinate system and base layer for the map
+  
+  geom_spatraster(data = log10(plant_richness_masked)) +   # Add raster layer after log10 transformation (e.g., for better scaling)
+                                               # geom_spatraster() plots raster data (gridded spatial data)
+                                               # Disp_2100 appears to be displacement data, possibly climate projections for year 2100
+                                               # log10() transformation compresses the data range and makes extreme values more visible
+                                               # This is common when data spans several orders of magnitude
+  
+  # Configure colour scale for continuous raster
+  scale_fill_whitebox_c(
+    palette = "muted",           # Use a muted colour palette for readability
+                                 # "muted" creates softer, less saturated colors that are easier on the eyes
+                                 # white-box package provides scientifically-appropriate color palettes
+    
+    na.value = NA,               # Do not assign a colour to NA values
+                                 # NA values (missing data) will be transparent/invisible on the map
+                                 # This prevents misleading visualization of missing data areas
+    
+    breaks = 1:4,                # Legend breaks corresponding to log10 values
+                                 # Creates 5 breaks: -2, -1, 0, 1, 2
+                                 # These correspond to 0.01, 0.1, 1, 10, 100 in original units
+    
+    labels = 10^c(1:4),          # Labels convert log10 back to linear interpretation
+
+    name = "Species Richness",   # Legend title indicating the unit
+                                 # Clearly identifies what the colors represent
+                                 # Units suggest this is measuring speed/rate of change
+    
+    limit = c(1, 4),            # Limit the colour scale to log10(10) and log10(10000)
+                                 # Values outside this range will be colored as the extreme colors
+                                 # This prevents outliers from dominating the color scale
+    
+    guide = guide_colorbar(
+        title.position = "top",  # Position the legend title above the color bar
+        title.hjust = 0.5,       # Center the title horizontally (0.5 = center)
+        barwidth = 15,           # Make the color bar 15 units wide (relatively wide)
+        barheight = 0.5          # Make the color bar 0.5 units tall (relatively thin)
+    )
+  ) +
+  
+  geom_spatvector(fill = NA) +   # Overlay the world vector borders on top without fill (only outlines)
+                                 # This adds country/region boundaries as black lines
+                                 # fill = NA means no fill color, just the outline
+                                 # This helps viewers identify geographic regions
+  
+  labs(
+    title    = "Global Vascular Plant Species Richness",
+    subtitle = "iNaturalist Geomodel ranges · log_10(species per cell)"
+  ) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin      = margin(5, 5, 5, 5)
+  )
+```
+
+Using the iNaturalist ranges, we then estimated the Extent of Occurrence (EOO) of the evaluated species and used it to (i) define species assemblages at a 10 × 10 km resolution and (ii) estimate the likely IUCN endangerment category based on area (criterion B), as summarised in [@collen2016]. We approximate IUCN Red List threat categories using the **Extent of Occurrence (EOO)** thresholds defined by @collen2016:
+
+| Category | EOO threshold |
+|:--------:|:-------------:|
+|    CR    | \< 1,000 km²  |
+|    EN    | \< 5,000 km²  |
+|    VU    | \< 20,000 km² |
+|    NT    | ≥ 20,000 km²  |
+
+```{r}
+#| label: iucn-status
+#| eval: false
+
+# ==============================================================================
+# SECTION 1: DEFINE ENDENGERMENT STATUS 
+# ==============================================================================
+
+#--- 1a. For each GeoPackage, calculate the area of each species range polygon 
+#        and classify it according to EOO-based IUCN thresholds. ---------------
+IUCN_status_list <- lapply(
+    dir("./Plants_Phylo",
+      pattern = ".gpkg",
+      full.names = TRUE),
+  function(x) {
+    
+    Vect_Ranges <- st_read(x)
+    
+    # Keep only species-level records
+    Vect_Ranges_spp <- Vect_Ranges[Vect_Ranges$rank == "species", ]
+    
+    IUCN_list <- lapply(
+      seq_len(nrow(Vect_Ranges_spp)),
+      function(z) {
+        # Compute area in km² (st_area returns m²; divide by 1e6)
+        area_km2 <- as.numeric(
+          st_area(st_make_valid(Vect_Ranges_spp[z, ])) / 1e6
+        )
+        
+        # Classify using IUCN EOO thresholds (Collen et al. 2016)
+        status <- dplyr::case_when(
+          area_km2 <  10000  ~ "CR",
+          area_km2 <  50000  ~ "EN",
+          area_km2 < 100000  ~ "VU",
+          TRUE              ~ "NT"
+        )
+        
+        data.frame(
+          species  = Vect_Ranges_spp[z, ]$name,
+          area.km2 = area_km2,
+          status   = status
+        )
+      }
+    )
+    
+    do.call("rbind", IUCN_list)
+  }
+)
+
+# Combine all batches
+IUCN_status_Tbl <- do.call("rbind", IUCN_status_list)
+
+# Save
+write.csv(IUCN_status_Tbl,
+          "./Drift/IUCN/IUCN_status_Plants.csv",
+          row.names = FALSE)
+
+#1b. Count species per category, ordered CR → NT
+IUCN_summary <- table(IUCN_status_Tbl$status)[c("CR", "EN", "VU", "NT")]
+
+#1c. PLOT
+barplot(IUCN_summary,
+        log  = "y",
+        las  = 1,
+        col  = c("#d73027", "#f46d43", "#fdae61", "#74add1"),
+        ylab = "Number of species (log scale)",
+        main = "IUCN threat status (EOO-based)")
+
+```
+
+We then generated a phylogeny for these species using [`U.PhyloMaker`](https://github.com/jinyizju/U.PhyloMaker). As described in [@jin2019], to construct a dated phylogeny tree using `U.PhyloMaker` we will use a backbone tree (i.e., the GBOTB tree, which is a combination of [@smith2018] and [@zanne2013]), anchored to the World Checklist of Vascular Plants nomenclature [@WCVP2024]. As many of the evaluated species are not the backbone tree, we load a Genus–Family Table to help randomly grafting unknown species to the genus. The end phylogeny contains most of the species, noting that some species cannot be grafted because their genera do not match any in the backbone phylogeny. We visualise the phylogeny at Genus Level (@fig-plot-genus-phylogeny) by pruning it to one representative species per genus before plotting.
+
+```{r}
+#| label: extract-species-names
+#| eval: false
+
+#--- 0. Load the library -------------------------------------------------------
+library(U.PhyloMaker)
+
+
+# ==============================================================================
+# SECTION 1: BUILD A PHYLOGENY FOR EVALUATED SPECIES 
+# ==============================================================================
+
+#--- 1b. Load the date to create the phylogeny ---------------------------------
+
+#Subset to species-rank names only 
+spp_use <- names(rast("./Drift/Distributions/iNaturalist_geomodel_Plantae_ALL.tif"))
+
+# Load the GBOTB mega-tree (backbone phylogeny for vascular plants). ----
+# Source: http://sftp.kew.org/pub/data-repositories/WCVP/
+megatree.Plants <- read.tree("./Drift/Phylogeny/GBOTB.extended.WCVP.tre")
+
+# Load the genus-to-family look-up table required by U.PhyloMaker
+gen.list.Plants <- read.csv("./Drift/Phylogeny/Genus_Family.csv", stringsAsFactors = FALSE)
+names(gen.list.Plants) <- tolower(colnames(gen.list.Plants))
+
+#--- 1c. Format species list: replace dots/underscores with spaces (common in
+#        database exports), and extract genus as first word of species name ----
+plant_for_phylo <- data.frame(
+  species = gsub("[._]", " ", spp_use),
+  genus   = sapply(strsplit(spp_use, "[ ]"), function(x) x[1])
+)
+
+# Remove records with malformed names (fewer than two space-separated parts)
+valid_species <- sapply(strsplit(plant_for_phylo$species, " "), length) >= 2
+plant_for_phylo <- plant_for_phylo[valid_species, ]
+
+#--- 1d. phylogeny construction ------------------------------------------------
+
+# Helper: wrapper around phylo.maker with error handling.
+# scenario = 3 inserts species at the mid-point of the stem branch
+# when the genus is present in the backbone tree.
+construct_phylogeny <- function(species_data, tree, gen_list, scenario = 3) {
+  tryCatch({
+    phylo.maker(
+      sp.list    = species_data,
+      tree       = tree,
+      gen.list   = gen_list,
+      nodes.type = 1,
+      scenario   = scenario
+    )
+  }, error = function(e) {
+    cat("Phylogeny construction failed:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+# Run phylogeny construction for the full species list
+phylo_result <- construct_phylogeny(plant_for_phylo, megatree.Plants, gen.list.Plants)
+
+# Save the Newick tree to disk
+write.tree(phylo_result[[1]],
+           "./Drift/Phylogeny/constructed_phylogeny.tre")
+
+
+# ==============================================================================
+# SECTION 2: PLOT THE PHYLOGENY AT THE GENUS LEVEL 
+# ==============================================================================
+
+#--- 2a. Prune the phylogeny ---------------------------------------------------
+
+# Extract genus from each tip label (format: "Genus_species")
+genus <- sub("_.*", "", tree$tip.label)
+
+# Retain one tip per genus (first occurrence)
+keep_tips  <- tree$tip.label[!duplicated(genus)]
+tree_genus <- keep.tip(tree, keep_tips)
+
+# Rename tips to genus only for readability
+tree_genus$tip.label <- sub("_.*", "", tree_genus$tip.label)
+
+#--- 2b. Plot ------------------------------------------------------------------
+# Fan plot: use.edge.length = FALSE gives an equal-branch cladogram,
+# which is clearer when there are thousands of tips
+plot(tree_genus,
+     type           = "f",
+     use.edge.length = FALSE,
+     root.edge      = FALSE,
+     cex            = 0.1,
+     x.lim          = c(-1, 1),
+     y.lim          = c(-1, 1),
+     main           = "Genus-level plant phylogeny")
+```
+
+```{r}
+#| label: fig-plot-genus-phylogeny
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: Fan phylogram of plant genera represented in iNaturalist range data (one species retained per genus).
+#| fig-height: 10
+#| fig-width: 10
+#--- 0. Load packages
+library(ape)
+
+# ==============================================================================
+# SECTION 1: PLOT THE PHYLOGENY AT THE GENUS LEVEL 
+# ==============================================================================
+
+#--- 1a. Load the phylogeny ---------------------------------------------------
+tree <- read.tree("./Drift/Phylogeny/constructed_phylogeny.tre")
+
+#--- 1b. Prune the phylogeny ---------------------------------------------------
+# Extract genus from each tip label (format: "Genus_species")
+genus <- sub("_.*", "", tree$tip.label)
+
+# Retain one tip per genus (first occurrence)
+keep_tips  <- tree$tip.label[!duplicated(genus)]
+tree_genus <- keep.tip(tree, keep_tips)
+
+# Rename tips to genus only for readability
+tree_genus$tip.label <- sub("_.*", "", tree_genus$tip.label)
+
+#--- 1c. Plot ------------------------------------------------------------------
+# Fan plot: use.edge.length = FALSE gives an equal-branch cladogram,
+# which is clearer when there are thousands of tips
+plot(tree_genus,
+     type           = "f",
+     use.edge.length = FALSE,
+     root.edge      = FALSE,
+     cex            = 0.1,
+     x.lim          = c(-1, 1),
+     y.lim          = c(-1, 1),
+     main           = "Genus-level plant phylogeny")
+```
+
+To estimate phylogenetic diversity (PD) in each spatial cell before and after removing at-risk species, the analysis proceeds in three stages. First, we load the required inputs: species range maps in raster format, the seed-disperser phylogeny, and the IUCN Red List status table. Second, we define a core PD function that serves as the computational unit of the analysis. This function iterates cell by cell across the raster: for each cell, it receives a presence–absence vector—coded as 1 (present), 0 (absent), or NA (no data)—and uses it to prune the full phylogeny to the subset of species occurring in that cell. From this pruned subtree, the function returns two metrics: species richness, as the number of present species, and phylogenetic diversity, calculated as the total branch length of the subtree, capturing the evolutionary distinctiveness of the local assemblage beyond simple species counts. Finally, we apply this function across all cells to generate spatially explicit estimates of PD for the full, unmodified assemblage of seed-dispersing vertebrates (@fig-PD_Current).
+
+```{r}
+#| label: pd-setup
+#| eval: false
+
+# ==============================================================================
+# SECTION 1: ESTIMATE PD FOR CURRENT ASSEMBLAGES 
+# ==============================================================================
+
+#--- 1a. Load the distribution and phylogeny data
+##Load all batch rasters into memory and stack them
+plant_range_raster <- rast("./Drift/Distributions/iNaturalist_geomodel_Plantae_ALL.tif")
+
+## Load the phylogeny
+phylo_resultUse <- read.tree("./Drift/Phylogeny/constructed_phylogeny.tre")
+
+# Keep only species present in both the raster stack and the phylogeny.
+# The raster uses spaces; the phylogeny uses underscores — we standardise here.
+spp_in_phylo <- gsub("_", " ", phylo_resultUse$tip.label)
+spp_use_rast <- names(plant_range_raster) %in% spp_in_phylo
+
+plant_range_raster_pruned <- plant_range_raster[[spp_use_rast]]
+
+#---1b. Estimate Phylogenetic Diversity
+# Helper: Estimate Phylogenetic Diversity for a single grid cell
+#
+# @param x       Numeric vector of presence (1) / absence (0) / NA values,
+# one element per species.
+# @param spp.names Character vector of species names corresponding to `x`.
+# @param phylo_tree An object of class `phylo`.
+# @return Named numeric vector: `sppRic` (species richness) and
+# `PD` (sum of branch lengths in the pruned tree).
+
+PD.perGrid.fnc <- function(x, spp.names, phylo_tree) {
+  require(ape)
+  
+  # Return NA if all values are missing (e.g., ocean/masked cell)
+  if (is.na(sum(x, na.rm = TRUE))) {
+    return(c(sppRic = NA, PD = NA))
+  }
+  
+  # Return zero if no species are present
+  if (sum(x, na.rm = TRUE) == 0) {
+    return(c(sppRic = 0, PD = 0))
+  }
+  
+  # Prune phylogeny to present species and compute metrics
+  spp_present <- spp.names[x == 1]
+  tree_pruned <- keep.tip(phylo_tree, gsub(" ", "_", spp_present))
+  
+  return(c(
+    sppRic = length(spp_present),
+    PD     = sum(tree_pruned$edge.length)
+  ))
+}
+
+names.use <- names(plant_range_raster_pruned)
+
+# Initialise an ncpus-1 core cluster
+ncpus <- max(1, detectCores() - 1)
+cl <- makeCluster(ncpus, type = "PSOCK")
+
+clusterExport(cl, c("PD.perGrid.fnc", "names.use", "phylo_resultUse"))
+clusterEvalQ(cl, library(ape))
+
+# Apply PD function over all cells using terra::app()
+# Each cell returns a 2-element vector → output raster has 2 layers
+PD_raster <- app(
+  plant_range_raster_pruned,
+  fun = function(x) PD.perGrid.fnc(x, names.use, phylo_resultUse),
+  cores = cl
+)
+
+stopCluster(cl)
+
+names(PD_raster) <- c("Species_Richness", "Phylogenetic_Diversity")
+
+writeRaster(
+  PD_raster,
+  "./Drift/Phylogeny/PD_raster.tif",
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW", "PREDICTOR=2")
+)
+
+# Apply land mask: ocean/non-plant cells become NA
+PD_current <- mask(PD_current, plant_rast_template)
+
+
+# ==============================================================================
+# SECTION 1: PLOT CURRENT PD 
+# ==============================================================================
+#--- 2a. Load & Project Vector World Boundaries --------------------------------
+
+# Download medium-resolution country polygons from Natural Earth
+# (scale = "medium" ≈ 1:50m; use "large" for finer detail at the cost of speed)
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert sf → SpatVector (terra's native vector class) for compatibility
+# with geom_spatvector() in tidyterra
+world_vect <- vect(world_sf)
+
+# Reproject to Eckert IV (equal-area pseudocylindrical):
+#   - Preserves area relationships across the globe
+#   - Standard choice for global thematic/choropleth maps
+#   - PROJ string: +proj=eck4
+world_eck4 <- project(world_vect, "+proj=eck4")
+
+#--- 2a. Reproject the PD raster -----------------------------------------------
+# Also reproject the PD raster to Eckert IV so raster + vector align correctly.
+# method = "bilinear" is appropriate for continuous data (PD values).
+# NOTE: If this step is skipped, tidyterra will attempt on-the-fly reprojection,
+# which is slower and less controllable.
+PD_current_eck4 <- project(PD_current, "+proj=eck4", method = "bilinear")
+# Compute Log10-Transformed PD (for plotting only)
+# PD values often span several orders of magnitude across biomes.
+# A log10 transformation compresses the range so colour gradients
+# highlight variation in species-poor regions, not just the highest values.
+# We store this as a new object to keep the raw data intact.
+PD_log <- log10(PD_current_eck4)
+
+#--- 2c. Build the Map ---------------------------------------------------------
+ggplot() +
+
+## Base world polygons (filled grey, no border)
+  # Rendered first so they sit below the raster layer.
+  # Provides visual context for ocean and landmass extent.
+  geom_spatvector(data  = world_eck4) +
+
+## PD raster layer
+  # geom_spatraster() from {tidyterra} plots SpatRaster objects natively.
+  # The raster must already be in the same CRS as the base map (Eckert IV).
+  geom_spatraster(data = PD_log) +
+
+## Country border overlay
+  # Drawn on top of raster so coastlines/borders remain legible.
+  # fill = NA means only the outline stroke is visible.
+  geom_spatvector(
+    data      = world_eck4,
+    fill      = NA
+    ) +
+
+## Continuous colour scale (whitebox "muted" palette)
+  # whitebox palettes are designed for cartographic use:
+  #   - perceptually uniform (equal steps in lightness)
+  #   - print- and colourblind-friendly
+  # "muted" = low saturation; appropriate for scientific figures.
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,          # Transparent for masked (ocean/no-data) cells
+    name     = "Log_10 PD", 
+
+    # Colour bar guide: wide and thin for bottom placement
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,   # Centred title
+      barwidth       = unit(120, "mm"),  # Explicit units prevent scaling issues
+      barheight      = unit(3,  "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+
+## Theme & layout
+  theme(
+    legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+    plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
++
+
+## Labels ---------------------------------------------------------------
+  labs(
+    title    = "Global Vascular Plant Phylogenetic Diversity",
+    subtitle = "Current conditions · Eckert IV equal-area projection · log_10(PD)"
+  )
+```
+
+```{r}
+#| label: fig-PD_Current
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-height: 6
+#| fig-width: 8
+
+# Phylogenetic Diversity (PD) Map — Current Conditions
+# Visualization of global vascular plant PD in Eckert IV projection
+
+# 2. Load & Prepare Raster Data
+
+# Load the second layer of the PD raster (layer 2 = current-period PD values)
+# PD (Phylogenetic Diversity) measures the total branch length in a
+# phylogenetic tree connecting all species in a given grid cell.
+PD_current <- rast("./Drift/Phylogeny/PD_raster.tif", lyrs = 2)
+# NOTE: Use `lyrs =` (plural) — `lyr =` is deprecated in recent terra versions
+
+
+# Load the plant presence/naturalised raster to use as a land/ocean mask.
+# Only the first layer is needed (used purely as a spatial template).
+# This restricts PD values to terrestrial cells where plant occurrence
+# data exists, avoiding spurious values over ocean pixels.
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+
+# Apply land mask: ocean/non-plant cells become NA
+PD_current <- mask(PD_current, plant_rast_template)
+
+
+# 3. Load & Project Vector World Boundaries
+
+# Download medium-resolution country polygons from Natural Earth
+# (scale = "medium" ≈ 1:50m; use "large" for finer detail at the cost of speed)
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert sf → SpatVector (terra's native vector class) for compatibility
+# with geom_spatvector() in tidyterra
+world_vect <- vect(world_sf)
+
+# Reproject to Eckert IV (equal-area pseudocylindrical):
+#   - Preserves area relationships across the globe
+#   - Standard choice for global thematic/choropleth maps
+#   - PROJ string: +proj=eck4
+world_eck4 <- project(world_vect, "+proj=eck4")
+
+# Also reproject the PD raster to Eckert IV so raster + vector align correctly.
+# method = "bilinear" is appropriate for continuous data (PD values).
+# NOTE: If this step is skipped, tidyterra will attempt on-the-fly reprojection,
+# which is slower and less controllable.
+PD_current_eck4 <- project(PD_current, "+proj=eck4", method = "bilinear")
+
+
+# 4. Compute Log10-Transformed PD (for plotting only)
+
+# PD values often span several orders of magnitude across biomes.
+# A log10 transformation compresses the range so colour gradients
+# highlight variation in species-poor regions, not just the highest values.
+# We store this as a new object to keep the raw data intact.
+PD_log <- log10(PD_current_eck4)
+
+
+# 5. Build the Map
+
+ggplot() +
+
+# --- 5a. Base world polygons (filled grey, no border) -------------------------
+  # Rendered first so they sit below the raster layer.
+  # Provides visual context for ocean and landmass extent.
+  geom_spatvector(data  = world_eck4) +
+
+# --- 5b. PD raster layer ------------------------------------------------------
+  # geom_spatraster() from {tidyterra} plots SpatRaster objects natively.
+  # The raster must already be in the same CRS as the base map (Eckert IV).
+  geom_spatraster(data = PD_log) +
+
+# --- 5c. Country border overlay -----------------------------------------------
+  # Drawn on top of raster so coastlines/borders remain legible.
+  # fill = NA means only the outline stroke is visible.
+  geom_spatvector(
+    data      = world_eck4,
+    fill      = NA
+    ) +
+
+# --- 5d. Continuous colour scale (whitebox "muted" palette) -------------------
+  # whitebox palettes are designed for cartographic use:
+  #   - perceptually uniform (equal steps in lightness)
+  #   - print- and colourblind-friendly
+  # "muted" = low saturation; appropriate for scientific figures.
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,          # Transparent for masked (ocean/no-data) cells
+    name     = "Log₁₀ PD", # Unicode subscript for a polished legend title
+
+    # Colour bar guide: wide and thin for bottom placement
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,   # Centred title
+      barwidth       = unit(120, "mm"),  # Explicit units prevent scaling issues
+      barheight      = unit(3,  "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+
+# --- 5e. Theme & layout -------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+) +
+
+# --- 5f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Global Vascular Plant Phylogenetic Diversity",
+    subtitle = "Current conditions · Eckert IV equal-area projection · log₁₀(PD)"
+  )
+
+```
+
+We compare the PD for all species to the situation when all threatened species are removed (**IUCN-filtered scenario**) and when a random subset of species are removed (**Null model**).
+
+1.  **IUCN-filtered scenario**: remove species with EOO \< 100,000 km² (@fig-PD_no_IUCN)
+
+```{r}
+#| label: PD_no_IUCN
+#| eval: false
+# ==============================================================================
+# SECTION 1: ESTIMATE PD FOR REDUCED ASSEMBLAGES 
+# ==============================================================================
+
+#--- 1a. Load data and Filter Endenger species ---------------------------------
+
+# Load IUCN status table 
+IUCN_status_Tbl <- read.csv("./Drift/IUCN/IUCN_status_Plants.csv", row.names = NULL)
+
+# Retain only species with EOO ≥ 100,000 km² (i.e., remove threatened spp.)
+IUCN_status_Tbl_pruned <- IUCN_status_Tbl[IUCN_status_Tbl$area.km2 > 100000, ]
+
+# Intersect with phylogeny to ensure all retained species have tree tips
+spp_use_IUCN <- IUCN_status_Tbl_pruned$species %in%
+                  gsub("_", " ", phylo_resultUse$tip.label)
+
+plant_richness_no_IUCN <- plant_range_raster_pruned[[spp_use_IUCN]]
+names.use.IUCN <- names(plant_richness_no_IUCN)
+
+#--- 1b. Run PD estimation on the threat-filtered assemblages ------------------
+
+library(parallel)
+# Initialise an ncpus-1 core cluster
+ncpus <- max(1, detectCores() - 1)
+cl <- makeCluster(ncpus, type = "PSOCK")
+
+# load functions and packages on each core
+clusterExport(cl, c("PD.perGrid.fnc", "names.use.IUCN", "phylo_resultUse"))
+clusterEvalQ(cl, library(ape))
+
+PD_raster_IUCN <- app(
+  plant_richness_no_IUCN,
+  fun = function(x) PD.perGrid.fnc(x, names.use.IUCN, phylo_resultUse),
+  cores = cl
+)
+
+stopCluster(cl)
+
+names(PD_raster_IUCN) <- c("Species_Richness", "Phylogenetic_Diversity")
+
+writeRaster(
+  PD_raster_IUCN,
+  "./Drift/Phylogeny/PD_raster_IUCN.tif",
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW", "PREDICTOR=2")
+)
+
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+PD_raster_IUCN <- mask(PD_raster_IUCN, plant_rast_template)
+# Load & Project Vector World Boundaries
+
+#==============================================================================
+# SECTION 2: PLOT CURRENT PD 
+# ==============================================================================
+#--- 2a. Load & Project Vector World Boundaries --------------------------------
+
+# Download medium-resolution country polygons from Natural Earth
+# (scale = "medium" ≈ 1:50m; use "large" for finer detail at the cost of speed)
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert sf → SpatVector (terra's native vector class) for compatibility
+# with geom_spatvector() in tidyterra
+world_vect <- vect(world_sf)
+
+# Reproject to Eckert IV (equal-area pseudocylindrical):
+#   - Preserves area relationships across the globe
+#   - Standard choice for global thematic/choropleth maps
+#   - PROJ string: +proj=eck4
+world_eck4 <- project(world_vect, "+proj=eck4")
+
+# Also reproject the PD raster to Eckert IV so raster + vector align correctly.
+# method = "bilinear" is appropriate for continuous data (PD values).
+# NOTE: If this step is skipped, tidyterra will attempt on-the-fly reprojection,
+# which is slower and less controllable.
+PD_IUCN_eck4 <- project(PD_raster_IUCN, "+proj=eck4", method = "bilinear")
+
+
+#--- 2b. Compute Log10-Transformed PD (for plotting only) ----------------------
+
+# PD values often span several orders of magnitude across biomes.
+# A log10 transformation compresses the range so colour gradients
+# highlight variation in species-poor regions, not just the highest values.
+# We store this as a new object to keep the raw data intact.
+PD_log <- log10(PD_IUCN_eck4)
+
+
+#--- 2c. Build the Map ---------------------------------------------------------
+
+ggplot() +
+  
+# --- 1a. Base world polygons (filled grey, no border) -------------------------
+  # Rendered first so they sit below the raster layer.
+  # Provides visual context for ocean and landmass extent.
+  geom_spatvector(data  = world_eck4) +
+  
+# --- 1b. PD raster layer ------------------------------------------------------
+  # geom_spatraster() from {tidyterra} plots SpatRaster objects natively.
+  # The raster must already be in the same CRS as the base map (Eckert IV).
+  geom_spatraster(data = PD_log) +
+  
+# --- 1c. Country border overlay -----------------------------------------------
+  # Drawn on top of raster so coastlines/borders remain legible.
+  # fill = NA means only the outline stroke is visible.
+  geom_spatvector(
+    data      = world_eck4,
+    fill      = NA
+  ) +
+  
+# --- 1d. Continuous colour scale (whitebox "muted" palette) -------------------
+  # whitebox palettes are designed for cartographic use:
+  #   - perceptually uniform (equal steps in lightness)
+  #   - print- and colourblind-friendly
+  # "muted" = low saturation; appropriate for scientific figures.
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,          # Transparent for masked (ocean/no-data) cells
+    name     = "Log_10 PD", 
+    
+    # Colour bar guide: wide and thin for bottom placement
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,   # Centred title
+      barwidth       = unit(120, "mm"),  # Explicit units prevent scaling issues
+      barheight      = unit(3,  "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+  
+# --- 1e. Theme & layout -------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+) +
+  
+# --- 1f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Global Vascular Plant Phylogenetic Diversity",
+    subtitle = "After the removal of IUCN-threatened species"
+  )
+
+
+```
+
+```{r}
+#| label: fig-PD_no_IUCN
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-height: 6
+#| fig-width: 8
+
+#==============================================================================
+# SECTION 2: PLOT CURRENT PD 
+# ==============================================================================
+#--- 2a. Load & Project Vector World Boundaries --------------------------------
+
+# Download medium-resolution country polygons from Natural Earth
+# (scale = "medium" ≈ 1:50m; use "large" for finer detail at the cost of speed)
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert sf → SpatVector (terra's native vector class) for compatibility
+# with geom_spatvector() in tidyterra
+world_vect <- vect(world_sf)
+
+# Reproject to Eckert IV (equal-area pseudocylindrical):
+#   - Preserves area relationships across the globe
+#   - Standard choice for global thematic/choropleth maps
+#   - PROJ string: +proj=eck4
+world_eck4 <- project(world_vect, "+proj=eck4")
+
+# Mask out ocean cells using the template (which only covers land)
+PD_raster_IUCN <- rast("./Drift/Phylogeny/PD_raster_IUCN.tif",
+                       lyr=2)
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+PD_raster_IUCN <- mask(PD_raster_IUCN, plant_rast_template)
+# Load & Project Vector World Boundaries
+
+# Also reproject the PD raster to Eckert IV so raster + vector align correctly.
+# method = "bilinear" is appropriate for continuous data (PD values).
+# NOTE: If this step is skipped, tidyterra will attempt on-the-fly reprojection,
+# which is slower and less controllable.
+PD_IUCN_eck4 <- project(PD_raster_IUCN, "+proj=eck4", method = "bilinear")
+
+
+# Compute Log10-Transformed PD (for plotting only)
+
+# PD values often span several orders of magnitude across biomes.
+# A log10 transformation compresses the range so colour gradients
+# highlight variation in species-poor regions, not just the highest values.
+# We store this as a new object to keep the raw data intact.
+PD_log <- log10(PD_IUCN_eck4)
+
+
+# Build the Map
+
+ggplot() +
+  
+# --- 1a. Base world polygons (filled grey, no border) -------------------------
+  # Rendered first so they sit below the raster layer.
+  # Provides visual context for ocean and landmass extent.
+  geom_spatvector(data  = world_eck4) +
+  
+# --- 1b. PD raster layer ------------------------------------------------------
+  # geom_spatraster() from {tidyterra} plots SpatRaster objects natively.
+  # The raster must already be in the same CRS as the base map (Eckert IV).
+  geom_spatraster(data = PD_log) +
+  
+# --- 1c. Country border overlay -----------------------------------------------
+  # Drawn on top of raster so coastlines/borders remain legible.
+  # fill = NA means only the outline stroke is visible.
+  geom_spatvector(
+    data      = world_eck4,
+    fill      = NA
+  ) +
+  
+# --- 1d. Continuous colour scale (whitebox "muted" palette) -------------------
+  # whitebox palettes are designed for cartographic use:
+  #   - perceptually uniform (equal steps in lightness)
+  #   - print- and colourblind-friendly
+  # "muted" = low saturation; appropriate for scientific figures.
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,          # Transparent for masked (ocean/no-data) cells
+    name     = "Log_10 PD", 
+    
+    # Colour bar guide: wide and thin for bottom placement
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,   # Centred title
+      barwidth       = unit(120, "mm"),  # Explicit units prevent scaling issues
+      barheight      = unit(3,  "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+  
+# --- 1e. Theme & layout -------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+) +
+  
+# --- 1f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Global Vascular Plant Phylogenetic Diversity",
+    subtitle = "After the removal of IUCN-threatened species"
+  )
+
+
+
+```
+
+2.  **Null model**: 100 random removals of the same number of species as in scenario 1 (@fig-PD_Rnd)
+
+```{r}
+#| label: PD_Rnd
+#| eval: false
+
+# ==============================================================================
+# SECTION 1: ESTIMATE PD for NULL ASSEMBLAGES 
+# ==============================================================================
+
+n_rnd    <- 100          # number of randomisations
+n_retain <- nlyr(plant_richness_no_IUCN)  # species to keep each iteration
+
+PD_raster_rnd_list <- vector("list", n_rnd)
+
+for (j in seq_len(n_rnd)) {
+  t_start <- Sys.time()
+  
+  # Draw a random species subset of the same size as the IUCN-filtered set.
+  # Species are drawn from the phylogeny-matched raster (plant_range_raster_pruned),
+  # so no additional phylogeny check is needed.
+  spp_use_rnd <- sample(names(plant_range_raster_pruned), n_retain)
+  plant_richness_rnd <- plant_range_raster_pruned[[spp_use_rnd]]
+  names.use.rnd <- names(plant_richness_rnd)
+  
+  # Estimate PD for the random assemblage
+  cl <- makeCluster(8)
+  clusterExport(cl, c("PD.perGrid.fnc", "names.use.rnd", "phylo_resultUse"))
+  clusterEvalQ(cl, library(ape))
+  
+  PD_raster_rnd_j <- app(
+    plant_richness_rnd,
+    fun = function(x) PD.perGrid.fnc(x, names.use.rnd, phylo_resultUse),
+    cores = cl
+  )
+  
+  stopCluster(cl)
+  
+  names(PD_raster_rnd_j) <- c("Species_Richness", "Phylogenetic_Diversity")
+  PD_raster_rnd_list[[j]] <- PD_raster_rnd_j
+  
+}
+
+# Extract only the PD layer from each randomisation and stack them
+PD_raster_rnd <- do.call("c", lapply(PD_raster_rnd_list, function(x) x[[2]]))
+
+writeRaster(
+  PD_raster_rnd,
+  "./Drift/Phylogeny/PD_raster_rnd.tif",
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW", "PREDICTOR=2")
+)
+
+# Projects the world map into Eckert IV projection, suitable for global thematic maps
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+PD_raster_rnd <- mask(PD_raster_rnd, plant_rast_template)
+# Load & Project Vector World Boundaries
+
+#==============================================================================
+# SECTION 2: PLOT CURRENT PD 
+# ==============================================================================
+#--- 2a. Load & Project Vector World Boundaries --------------------------------
+
+# Download medium-resolution country polygons from Natural Earth
+# (scale = "medium" ≈ 1:50m; use "large" for finer detail at the cost of speed)
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert sf → SpatVector (terra's native vector class) for compatibility
+# with geom_spatvector() in tidyterra
+world_vect <- vect(world_sf)
+
+# Reproject to Eckert IV (equal-area pseudocylindrical):
+#   - Preserves area relationships across the globe
+#   - Standard choice for global thematic/choropleth maps
+#   - PROJ string: +proj=eck4
+world_eck4 <- project(world_vect, "+proj=eck4")
+
+#---2b. Also reproject the PD raster to Eckert IV so raster + vector align correctly.
+# method = "bilinear" is appropriate for continuous data (PD values).
+# NOTE: If this step is skipped, tidyterra will attempt on-the-fly reprojection,
+# which is slower and less controllable.
+PD_Rnd_eck4 <- project(PD_raster_Rnd, "+proj=eck4", method = "bilinear")
+
+
+#---2c. Compute Log10-Transformed PD (for plotting only) -----------------------
+
+# PD values often span several orders of magnitude across biomes.
+# A log10 transformation compresses the range so colour gradients
+# highlight variation in species-poor regions, not just the highest values.
+# We store this as a new object to keep the raw data intact.
+PD_log <- log10(PD_Rnd_eck4)
+
+
+#---2d. Build the Map ----------------------------------------------------------
+
+ggplot() +
+  
+# --- 1a. Base world polygons (filled grey, no border) -------------------------
+  # Rendered first so they sit below the raster layer.
+  # Provides visual context for ocean and landmass extent.
+  geom_spatvector(data  = world_eck4) +
+  
+# --- 1b. PD raster layer ------------------------------------------------------
+  # geom_spatraster() from {tidyterra} plots SpatRaster objects natively.
+  # The raster must already be in the same CRS as the base map (Eckert IV).
+  geom_spatraster(data = PD_log) +
+  
+# --- 1c. Country border overlay -----------------------------------------------
+  # Drawn on top of raster so coastlines/borders remain legible.
+  # fill = NA means only the outline stroke is visible.
+  geom_spatvector(
+    data      = world_eck4,
+    fill      = NA
+  ) +
+  
+# --- 1d. Continuous colour scale (whitebox "muted" palette) -------------------
+  # whitebox palettes are designed for cartographic use:
+  #   - perceptually uniform (equal steps in lightness)
+  #   - print- and colourblind-friendly
+  # "muted" = low saturation; appropriate for scientific figures.
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,          # Transparent for masked (ocean/no-data) cells
+    name     = "Log_10 PD", 
+    
+    # Colour bar guide: wide and thin for bottom placement
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,   # Centred title
+      barwidth       = unit(120, "mm"),  # Explicit units prevent scaling issues
+      barheight      = unit(3,  "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+  
+# --- 1e. Theme & layout -------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+) +
+  
+# --- 1f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Global Vascular Plant Phylogenetic Diversity",
+    subtitle = "After the Random removal of species"
+  )
+```
+
+```{r}
+#| label: fig-PD_Rnd
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-height: 6
+#| fig-width: 8
+
+#==============================================================================
+# SECTION 2: PLOT CURRENT PD 
+# ==============================================================================
+#--- 2a. Load & Project Vector World Boundaries --------------------------------
+
+# Download medium-resolution country polygons from Natural Earth
+# (scale = "medium" ≈ 1:50m; use "large" for finer detail at the cost of speed)
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Convert sf → SpatVector (terra's native vector class) for compatibility
+# with geom_spatvector() in tidyterra
+world_vect <- vect(world_sf)
+
+# Reproject to Eckert IV (equal-area pseudocylindrical):
+#   - Preserves area relationships across the globe
+#   - Standard choice for global thematic/choropleth maps
+#   - PROJ string: +proj=eck4
+world_eck4 <- project(world_vect, "+proj=eck4")
+
+#---2b.  Mask out ocean cells using the template (which only covers land)
+PD_raster_Rnd <- mean(rast("./Drift/Phylogeny/PD_raster_rnd.tif"))
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+PD_raster_Rnd <- mask(PD_raster_Rnd, plant_rast_template)
+
+#---2c. Also reproject the PD raster to Eckert IV so raster + vector align correctly.
+# method = "bilinear" is appropriate for continuous data (PD values).
+# NOTE: If this step is skipped, tidyterra will attempt on-the-fly reprojection,
+# which is slower and less controllable.
+PD_Rnd_eck4 <- project(PD_raster_Rnd, "+proj=eck4", method = "bilinear")
+
+
+#---2d Compute Log10-Transformed PD (for plotting only) ------------------------
+
+# PD values often span several orders of magnitude across biomes.
+# A log10 transformation compresses the range so colour gradients
+# highlight variation in species-poor regions, not just the highest values.
+# We store this as a new object to keep the raw data intact.
+PD_log <- log10(PD_Rnd_eck4)
+
+
+#--- 2e. Build the Map ---------------------------------------------------------
+
+ggplot() +
+  
+# --- 1a. Base world polygons (filled grey, no border) -------------------------
+  # Rendered first so they sit below the raster layer.
+  # Provides visual context for ocean and landmass extent.
+  geom_spatvector(data  = world_eck4) +
+  
+# --- 1b. PD raster layer ------------------------------------------------------
+  # geom_spatraster() from {tidyterra} plots SpatRaster objects natively.
+  # The raster must already be in the same CRS as the base map (Eckert IV).
+  geom_spatraster(data = PD_log) +
+  
+# --- 1c. Country border overlay -----------------------------------------------
+  # Drawn on top of raster so coastlines/borders remain legible.
+  # fill = NA means only the outline stroke is visible.
+  geom_spatvector(
+    data      = world_eck4,
+    fill      = NA
+  ) +
+  
+# --- 1d. Continuous colour scale (whitebox "muted" palette) -------------------
+  # whitebox palettes are designed for cartographic use:
+  #   - perceptually uniform (equal steps in lightness)
+  #   - print- and colourblind-friendly
+  # "muted" = low saturation; appropriate for scientific figures.
+  scale_fill_whitebox_c(
+    palette  = "muted",
+    na.value = NA,          # Transparent for masked (ocean/no-data) cells
+    name     = "Log_10 PD", 
+    
+    # Colour bar guide: wide and thin for bottom placement
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,   # Centred title
+      barwidth       = unit(120, "mm"),  # Explicit units prevent scaling issues
+      barheight      = unit(3,  "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+  
+# --- 1e. Theme & layout -------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+) +
+  
+# --- 1f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Global Vascular Plant Phylogenetic Diversity",
+    subtitle = "After the Random removal of species"
+  )
+```
+
+The **IUCN-filtered scenario** shows the expected change in PD due to the lost of engendered species. The **Null-model** **scenario** provides the expected PD under random loss, against which phylogeny non-randomness of the threatened set can be assessed - this simulates what PD would look like if the same number of species were removed at random (i.e., non-phylogenetically structured loss).
+
+Comparing observed PD under the IUCN threat scenario directly to the null mean is useful, but the raw difference depends on the absolute magnitude of PD in each cell — cells with high PD will always show larger absolute losses. The **Standardized Effect Size (SES)** places the observed loss on a common scale by expressing it in units of the null standard deviation:
+
+$$\text{SES}_{PD} = \frac{PD_{\text{obs}} - \overline{PD}_{\text{rand}}}{\sigma_{PD_{\text{rand}}}}$$
+
+where $PD_{\text{obs}}$ is the PD retained after removing threatened species (difference of the PD of the full community and the PD of the community with out engendered species), $\overline{PD}_{\text{rand}}$ is the per-cell mean PD change across the 100 random removals, and $\sigma_{PD_{\text{rand}}}$ is the corresponding standard deviation - (mean/sd of the differences between the PD of the full community and the PD of the communities with random removals).
+
+To summarise the results we map the SES. A diverging colour palette centred on zero makes it straightforward to identify cells where threat-driven PD loss is significantly greater (negative SES, warm colours) or smaller (positive SES, cool colours) than expected by chance (@fig-ses-map).
+
+```{r}
+#| label: ses-load
+#| eval: false
+
+# Mask out ocean cells using the template (which only covers land)
+PD_raster_Rnd <- rast("./Drift/Phylogeny/PD_raster_rnd.tif")
+# Compute per-cell mean, SD, and number of non-NA randomisations
+PD_raster_rnd_summ <- app(
+  PD_raster_Rnd,
+  function(x) {
+    c(Mean = mean(x,   na.rm = TRUE),
+      SD   = sd(x,     na.rm = TRUE),
+      n    = sum(!is.na(x)))
+  }
+)
+
+names(PD_raster_rnd_summ) <- c("Mean_PD_random", "SD_PD_random", "n_valid")
+
+writeRaster(
+  PD_raster_rnd_summ,
+  "./Drift/Phylogeny/PD_raster_rnd_summ.tif",
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW", "PREDICTOR=2")
+)
+
+
+# Load the PD raster for the IUCN threat-filtered assemblage (Part 5)
+PD_raster_IUCN <- rast("./Drift/Phylogeny//PD_raster_IUCN.tif")
+
+# Load the null-model summary raster (mean and SD across 100 randomisations)
+PD_raster_rnd_summ <- rast("./Drift/Phylogeny/PD_raster_rnd_summ.tif")
+
+# Confirm layer names are as expected
+names(PD_raster_IUCN)      # "Species_Richness", "Phylogenetic_Diversity"
+names(PD_raster_rnd_summ)  <- c("Mean_PD_random", "SD_PD_random", "n_valid")
+
+# Extract the PD layer from the IUCN-filtered raster
+PD_obs <- PD_raster_IUCN[["Phylogenetic_Diversity"]]
+
+# Extract null mean and SD from the randomisation summary
+PD_rnd_mean <- PD_raster_rnd_summ[["Mean_PD_random"]]
+PD_rnd_sd   <- PD_raster_rnd_summ[["SD_PD_random"]]
+
+# Compute SES cell-by-cell:
+#   SES = (PD_obs - mean(PD_rand)) / sd(PD_rand)
+# Cells where SD = 0 (all randomisations identical, e.g. very depauperate
+# assemblages) receive NA to avoid division by zero.
+SES_PD <- (PD_obs - PD_rnd_mean) / PD_rnd_sd
+
+# Assign a meaningful layer name
+names(SES_PD) <- "SES_PD_loss"
+
+# Save
+writeRaster(
+  SES_PD,
+  "./Drift/Phylogeny/SES_PD_loss.tif",
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW", "PREDICTOR=2")
+)
+
+# Mask ocean cells using the plant presence raster as a land template.
+# Only cells with native plant occurrence data are retained.
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+SES_PD_masked <- mask(SES_PD, plant_rast_template)
+
+# Reproject raster to Eckert IV (equal-area) BEFORE plotting.
+# Doing this explicitly is faster and more reliable than on-the-fly reprojection
+# inside ggplot. method = "bilinear" is correct for continuous SES values.
+SES_PD_eck4 <- project(SES_PD_masked, "+proj=eck4", method = "bilinear")
+
+
+# Load & Project World Boundaries
+
+world_eck4 <- ne_countries(scale = "medium", returnclass = "sf") |>
+  vect() |>                              # sf → SpatVector (terra)
+  project("+proj=eck4")                  # Reproject to Eckert IV
+
+
+# Define Colour Scale Parameters
+
+# SES is centred on 0 by construction, so a DIVERGING palette is correct:
+#   cool colours  → negative SES (more PD loss than chance)
+#   neutral/white → SES ≈ 0 (loss as expected under null model)
+#   warm colours  → positive SES (less PD loss than chance)
+#
+# Display limits: cap at ±5 SD — extreme outliers exist but capping
+# prevents them from collapsing all variation into a narrow colour band.
+# Cells outside ±5 are coloured as the palette extremes (oob = squish).
+SES_LIMITS <- c(-5, 5)
+SES_BREAKS <- c(-5, -2, 0, 2, 5)
+
+
+# Build the Map
+
+ggplot() +
+  
+# --- 1a. Grey land base (rendered below raster) -------------------------------
+  # Provides context for land areas where SES data is NA (no plant records).
+  geom_spatvector(data  = world_eck4) +
+  
+# --- 1b. SES-PD raster layer --------------------------------------------------
+  geom_spatraster(data = SES_PD_eck4) +
+  
+# --- 1c. Diverging colour scale centred on 0 ----------------------------------
+  # whitebox "pi_y_g" (pink–yellow–green) or "bl_yl_rd" (blue–yellow–red)
+  # are both diverging palettes. "muted" is sequential, so we switch to
+  # a diverging option that correctly encodes the signed SES metric.
+  scale_fill_whitebox_c(
+    palette   = "muted",          # Blue (negative) → yellow (0) → red (positive)
+    direction = -1,                  # Flip so blue = loss (negative), red = gain
+    na.value  = NA,                  # Ocean / no-data cells stay transparent
+    limits    = SES_LIMITS,
+    breaks    = SES_BREAKS,
+    labels    = SES_BREAKS,
+    oob       = scales::squish,      # Clamp out-of-bounds values to palette extremes
+    name      = "SES-PD",
+    
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = unit(120, "mm"),  # Device-independent units
+      barheight      = unit(3,   "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+  
+# --- 1d. Country border overlay -----------------------------------------------
+  # White thin lines stay visible over both cool and warm palette regions.
+  geom_spatvector(data      = world_eck4,
+    fill      = NA) +
+  
+# --- 1e. Theme ----------------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+) +
+  
+# --- 1f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Standardised Effect Size of Phylogenetic Diversity Loss",
+    subtitle = "SES-PD · Values below -2 and above 2 show  non-random phylogenetic erosion"
+  )
+```
+
+```{r}
+#| label: fig-ses-map
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: Standardized Effect Size of PD loss due to threatened species removal. Negative values (warm colours) indicate phylogenetically clustered threat — local floras where the threatened species are more evolutionarily distinct than expected by chance.
+#| fig-height: 6
+#| fig-width: 8
+
+#  Load & Prepare Raster Data
+
+# SES-PD: Standardised Effect Size of Phylogenetic Diversity loss.
+# Each cell value = (observed PD loss − mean null PD loss) / SD null PD loss.
+# Values << 0 indicate non-random phylogenetic erosion (closely related
+# species lost disproportionately); values >> 0 indicate PD is buffered.
+SES_PD <- rast("./Drift/Phylogeny/SES_PD_loss.tif")
+
+# Mask ocean cells using the plant presence raster as a land template.
+# Only cells with native plant occurrence data are retained.
+plant_rast_template <- rast("./Drift/Distributions/rast_plant_pres_nat.tif")[[1]]
+SES_PD_masked <- mask(SES_PD, plant_rast_template)
+
+# Reproject raster to Eckert IV (equal-area) BEFORE plotting.
+# Doing this explicitly is faster and more reliable than on-the-fly reprojection
+# inside ggplot. method = "bilinear" is correct for continuous SES values.
+SES_PD_eck4 <- project(SES_PD_masked, "+proj=eck4", method = "bilinear")
+
+
+# Load & Project World Boundaries
+
+world_eck4 <- ne_countries(scale = "medium", returnclass = "sf") |>
+  vect() |>                              # sf → SpatVector (terra)
+  project("+proj=eck4")                  # Reproject to Eckert IV
+
+
+# Define Colour Scale Parameters
+
+# SES is centred on 0 by construction, so a DIVERGING palette is correct:
+#   cool colours  → negative SES (more PD loss than chance)
+#   neutral/white → SES ≈ 0 (loss as expected under null model)
+#   warm colours  → positive SES (less PD loss than chance)
+#
+# Display limits: cap at ±5 SD — extreme outliers exist but capping
+# prevents them from collapsing all variation into a narrow colour band.
+# Cells outside ±5 are coloured as the palette extremes (oob = squish).
+SES_LIMITS <- c(-5, 5)
+SES_BREAKS <- c(-5, -2, 0, 2, 5)
+
+
+# Build the Map
+
+ggplot() +
+  
+# --- 1a. Grey land base (rendered below raster) -------------------------------
+  # Provides context for land areas where SES data is NA (no plant records).
+  geom_spatvector(data  = world_eck4) +
+  
+# --- 1b. SES-PD raster layer --------------------------------------------------
+  geom_spatraster(data = SES_PD_eck4) +
+  
+# --- 1c. Diverging colour scale centred on 0 ----------------------------------
+  # whitebox "pi_y_g" (pink–yellow–green) or "bl_yl_rd" (blue–yellow–red)
+  # are both diverging palettes. "muted" is sequential, so we switch to
+  # a diverging option that correctly encodes the signed SES metric.
+  scale_fill_whitebox_c(
+    palette   = "muted",          # Blue (negative) → yellow (0) → red (positive)
+    direction = -1,                  # Flip so blue = loss (negative), red = gain
+    na.value  = NA,                  # Ocean / no-data cells stay transparent
+    limits    = SES_LIMITS,
+    breaks    = SES_BREAKS,
+    labels    = SES_BREAKS,
+    oob       = scales::squish,      # Clamp out-of-bounds values to palette extremes
+    name      = "SES-PD",
+    
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      barwidth       = unit(120, "mm"),  # Device-independent units
+      barheight      = unit(3,   "mm"),
+      ticks.colour   = "white",
+      frame.colour   = "grey40"
+    )
+  ) +
+  
+# --- 1d. Country border overlay -----------------------------------------------
+  # White thin lines stay visible over both cool and warm palette regions.
+  geom_spatvector(data      = world_eck4,
+    fill      = NA) +
+  
+# --- 1e. Theme ----------------------------------------------------------------
+theme(
+  legend.position = "bottom",  # Position the color legend at bottom for space efficiency
+  plot.title       = element_text(size = 14, face = "bold",  hjust = 0.5),
+  plot.subtitle    = element_text(size = 11, hjust = 0.5),
+  plot.margin = margin(5, 5, 5, 5)
+)+
+  
+# --- 1f. Labels ---------------------------------------------------------------
+  labs(
+    title    = "Standardised Effect Size of Phylogenetic Diversity Loss",
+    subtitle = "SES-PD · Values below -2 and above 2 show  non-random phylogenetic erosion"
+    )
+```
+
+------------------------------------------------------------------------
+
+## Conclusion
+
+In this supplementary material, we have demonstrated a concrete implementation of the process-based framework outlined in the main text, illustrating how the community assembly processes driving ecological novelty can be operationalised using globally available biodiversity, distributional, and environmental data. Working through each of the four core processes in turn, we have shown how dispersal limitation, abiotic filtering, biotic interactions, and ecological drift can be translated into spatially explicit, quantifiable, and mappable indices that reveal where and how novel ecosystems are most likely to emerge.
+
+For **dispersal**, we estimated the mismatch between projected climate displacement velocities under RCP 6.0 and the dispersal capacities of multiple functional groups producing maps of dispersal lag that identify regions where species are at greatest risk of failing to track environmental change. For **abiotic filtering**, we generated maps of climate novelty. For **biotic interactions**, we combined distributional data from PHYLACINE 1.2.1 and BirdLife International with IUCN Red List endangerment classifications to map the current diversity of seed-dispersing vertebrates, the fraction of that diversity facing elevated extinction risk. For **ecological drift**, we used iNaturalist range data for vascular plants alongside phylogenetic information from global plant phylogenies to compute spatially explicit standardised effect sizes of phylogenetic diversity (SES-PD).
+
+Together, these four analytical threads operationalise the mapping framework proposed in the main text using a shared set of reproducible, openly available tools. Although the worked examples here focus on seed-dispersing vertebrates and vascular plants as tractable and data-rich case studies, the underlying logic applies equally to other interaction types and taxonomic groups. We therefore offer this implementation not as a definitive analysis, but as a reproducible and extensible template — one that can be adapted, deepened, and scaled as richer data, finer-resolution phylogenies, and more refined interaction databases become available.
